@@ -20,6 +20,7 @@ import re
 import subprocess
 import sys
 import time
+import builtins
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -39,8 +40,22 @@ def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
 
+# Global timestamped print
+def _ts_print(*args, **kwargs):
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        builtins.print(f"[{ts}] ", end='')
+        builtins.print(*args, **kwargs)
+    except Exception:
+        # Fallback to normal print if formatting fails for any reason
+        builtins.print(*args, **kwargs)
+
+# Override built-in print for this script to include timestamps
+print = _ts_print  # type: ignore
+
+
 def extract_uuid(url: str) -> Optional[str]:
-    m = re.search(r"https://cdn1\.suno\.ai/([^.]+)\.(mp3|mp4)", url.strip())
+    m = re.search(r"https://cdn1\.suno\.ai/([^.]+)\.(mp3|mp4|wav)", url.strip())
     return m.group(1) if m else None
 
 
@@ -438,8 +453,13 @@ def main():
         if args.device_id:
             headers["device-id"] = args.device_id
 
+    # First pass: collect unique UUIDs preserving first occurrence for naming
+    unique_map = {}
+    order = []
+    total_lines = 0
     with open(in_path, 'r', encoding='utf-8') as f:
         for raw in f:
+            total_lines += 1
             line = raw.strip()
             if not line:
                 continue
@@ -450,207 +470,229 @@ def main():
                 left, url = "", line.strip()
             uuid = extract_uuid(url)
             if not uuid:
-                print(f"Skipping (cannot extract uuid): {filename}")
+                print(f"Skipping line (cannot extract uuid): {line}")
                 continue
+            if uuid not in unique_map:
+                unique_map[uuid] = (left, url)
+                order.append(uuid)
 
-            # Decide filename according to --name-mode
-            # Determine extension from url
-            ext = os.path.splitext(url.split('?')[0])[-1].lower() or '.mp3'
-            # Gather details for potential title
-            details = collect_song_fields(uuid, details_dir)
-            title_from_details = None
-            if details:
-                data = details.get('data', details)
-                clip = data.get('clip') if isinstance(data, dict) else None
-                if clip and isinstance(clip, dict):
-                    title_from_details = clip.get('title')
-                else:
-                    title_from_details = data.get('title')
+    # Write temp file with unique cleaned UUIDs (one per line)
+    tmp_uuid_path = in_path.with_name(f"{in_path.stem}.unique_uuids.tmp")
+    try:
+        tmp_uuid_path.write_text("\n".join(order) + ("\n" if order else ""), encoding='utf-8')
+        print(f"Unique UUID list written: {tmp_uuid_path} ({len(order)} unique of {total_lines} lines)")
+    except Exception as e:
+        print(f"Failed to write unique UUID temp file: {e}")
 
-            if args.name_mode == 'input' and left:
-                filename = left
-                if not filename.lower().endswith(ext):
-                    filename += ext
-            elif args.name_mode == 'details' and title_from_details:
-                filename = f"{title_from_details}{ext}"
-            elif args.name_mode == 'uuid' or not left:
-                filename = f"{uuid}{ext}"
+    if not order:
+        print("No valid UUIDs found. Exiting.")
+        sys.exit(0)
+
+    total_unique = len(order)
+    print(f"Processing {total_unique} unique UUID(s)...")
+
+    # Processing loop over unique UUIDs only
+    for idx, uuid in enumerate(order, 1):
+        left, url = unique_map[uuid]
+
+        # Decide filename according to --name-mode
+        # Determine extension from url
+        ext = os.path.splitext(url.split('?')[0])[-1].lower() or '.mp3'
+        # Gather details for potential title
+        details = collect_song_fields(uuid, details_dir)
+        title_from_details = None
+        if details:
+            data = details.get('data', details)
+            clip = data.get('clip') if isinstance(data, dict) else None
+            if clip and isinstance(clip, dict):
+                title_from_details = clip.get('title')
             else:
-                filename = (left or uuid) + ext
+                title_from_details = data.get('title')
 
-            stem = Path(filename).stem
-            base_stem = stem
-            print(f"\n=== {filename} (uuid={uuid}) ===")
+        if args.name_mode == 'input' and left:
+            filename = left
+            if not filename.lower().endswith(ext):
+                filename += ext
+        elif args.name_mode == 'details' and title_from_details:
+            filename = f"{title_from_details}{ext}"
+        elif args.name_mode == 'uuid' or not left:
+            filename = f"{uuid}{ext}"
+        else:
+            filename = (left or uuid) + ext
 
-            # Check for existing MP3 with same UUID, but don't skip other formats
-            already_have_uuid = any_file_with_uuid(out_dir, uuid)
+        stem = Path(filename).stem
+        base_stem = stem
+        print(f"\n[{idx}/{total_unique}] === {filename} (uuid={uuid}) ===")
+
+        # Check for existing MP3 with same UUID, but don't skip other formats
+        already_have_uuid = any_file_with_uuid(out_dir, uuid)
+        if already_have_uuid:
+            print("Found existing MP3 with same UUID; will skip MP3 but still process other formats.")
+
+        # Gather details (already fetched above if needed)
+        if not details:
+            details = collect_song_fields(uuid, details_dir)
+        # Normalize fields for tagging
+        title = stem
+        artist = ''
+        cover_url = build_cover_url(uuid)
+        comment_parts = []
+
+        if details:
+            src = details.get('source')
+            data = details.get('data', {}) if 'data' in details else details
+            # Page clip path
+            clip = data.get('clip') if 'clip' in data else None
+            if clip:
+                title = clip.get('title') or title
+                artist = f"{clip.get('display_name','')} (@{clip.get('handle','')})".strip()
+                cover_url = clip.get('image_large_url') or clip.get('image_url') or cover_url
+                md = clip.get('metadata', {})
+                prompt = md.get('prompt')
+                tags_long = md.get('tags')
+                display_tags = clip.get('display_tags')
+                model = f"{clip.get('major_model_version','')} {clip.get('model_name','')}".strip()
+                dur = md.get('duration')
+                if prompt:
+                    comment_parts.append(f"prompt: {prompt}")
+                if display_tags:
+                    comment_parts.append(f"tags: {display_tags}")
+                elif tags_long:
+                    comment_parts.append(f"tags: {tags_long[:120]}")
+                if model:
+                    comment_parts.append(f"model: {model}")
+                if dur:
+                    comment_parts.append(f"duration: {dur}s")
+            else:
+                # oEmbed may have title/author_name/thumbnail_url
+                title = data.get('title') or title
+                artist = data.get('author_name') or artist
+                cover_url = data.get('thumbnail_url') or cover_url
+
+        # Prepend UUID to comment for broad containers
+        base_comment = ' | '.join([p for p in comment_parts if p])
+        comment = f"uuid={uuid}" + (f" | {base_comment}" if base_comment else "")
+        # Lyrics
+        lyrics_text, lyrics_lrc = pick_lyrics_from_details(details)
+        # If not present, try public Studio endpoints (no auth)
+        if not args.no_external_lyrics and (not lyrics_text and not lyrics_lrc):
+            e_plain, e_lrc = fetch_lyrics_external(uuid)
+            if e_plain or e_lrc:
+                lyrics_text = lyrics_text or e_plain
+                lyrics_lrc = lyrics_lrc or e_lrc
+
+        # Prepare canonical URLs for formats based on UUID
+        url_is_mp3 = url.lower().endswith('.mp3')
+        url_is_mp4 = url.lower().endswith('.mp4')
+        mp3_url = url if url_is_mp3 else f"{CDN_AUDIO}/{uuid}.mp3"
+        mp4_url = url if url_is_mp4 else f"{CDN_AUDIO}/{uuid}.mp4"
+
+        # MP3
+        if want_mp3:
             if already_have_uuid:
-                print("Found existing MP3 with same UUID; will skip MP3 but still process other formats.")
-
-            # Gather details (already fetched above if needed)
-            if not details:
-                details = collect_song_fields(uuid, details_dir)
-            # Normalize fields for tagging
-            title = stem
-            artist = ''
-            cover_url = build_cover_url(uuid)
-            comment_parts = []
-
-            if details:
-                src = details.get('source')
-                data = details.get('data', {}) if 'data' in details else details
-                # Page clip path
-                clip = data.get('clip') if 'clip' in data else None
-                if clip:
-                    title = clip.get('title') or title
-                    artist = f"{clip.get('display_name','')} (@{clip.get('handle','')})".strip()
-                    cover_url = clip.get('image_large_url') or clip.get('image_url') or cover_url
-                    md = clip.get('metadata', {})
-                    prompt = md.get('prompt')
-                    tags_long = md.get('tags')
-                    display_tags = clip.get('display_tags')
-                    model = f"{clip.get('major_model_version','')} {clip.get('model_name','')}".strip()
-                    dur = md.get('duration')
-                    if prompt:
-                        comment_parts.append(f"prompt: {prompt}")
-                    if display_tags:
-                        comment_parts.append(f"tags: {display_tags}")
-                    elif tags_long:
-                        comment_parts.append(f"tags: {tags_long[:120]}")
-                    if model:
-                        comment_parts.append(f"model: {model}")
-                    if dur:
-                        comment_parts.append(f"duration: {dur}s")
+                pass
+            mp3_name = f"{base_stem}.mp3"
+            mp3_dest = out_dir / mp3_name
+            if not mp3_dest.exists() and not already_have_uuid:
+                if download(mp3_url, mp3_dest):
+                    print(f"MP3 saved: {mp3_dest.name}")
                 else:
-                    # oEmbed may have title/author_name/thumbnail_url
-                    title = data.get('title') or title
-                    artist = data.get('author_name') or artist
-                    cover_url = data.get('thumbnail_url') or cover_url
-
-            # Prepend UUID to comment for broad containers
-            base_comment = ' | '.join([p for p in comment_parts if p])
-            comment = f"uuid={uuid}" + (f" | {base_comment}" if base_comment else "")
-            # Lyrics
-            lyrics_text, lyrics_lrc = pick_lyrics_from_details(details)
-            # If not present, try public Studio endpoints (no auth)
-            if not args.no_external_lyrics and (not lyrics_text and not lyrics_lrc):
-                e_plain, e_lrc = fetch_lyrics_external(uuid)
-                if e_plain or e_lrc:
-                    lyrics_text = lyrics_text or e_plain
-                    lyrics_lrc = lyrics_lrc or e_lrc
-
-            # Prepare canonical URLs for formats based on UUID
-            url_is_mp3 = url.lower().endswith('.mp3')
-            url_is_mp4 = url.lower().endswith('.mp4')
-            mp3_url = url if url_is_mp3 else f"{CDN_AUDIO}/{uuid}.mp3"
-            mp4_url = url if url_is_mp4 else f"{CDN_AUDIO}/{uuid}.mp4"
-
-            # MP3
-            if want_mp3:
-                if already_have_uuid:
-                    pass
-                mp3_name = f"{base_stem}.mp3"
-                mp3_dest = out_dir / mp3_name
-                if not mp3_dest.exists() and not already_have_uuid:
-                    if download(mp3_url, mp3_dest):
-                        print(f"MP3 saved: {mp3_dest.name}")
-                    else:
-                        print("MP3 download failed; continuing")
-                        continue
-                if not args.no_embed:
-                    # Cover sidecar
-                    cover_path = out_dir / f"{uuid}.jpeg"
-                    if not cover_path.exists():
-                        download(cover_url, cover_path)
-                    print("Embedding MP3 metadata and cover...")
-                    if embed_mp3(args.ffmpeg_path, mp3_dest, cover_path if cover_path.exists() else None, title, artist or 'Suno', comment):
-                        print("MP3 tagging complete")
-                    else:
-                        print("MP3 tagging failed")
-
-                # Embed UUID via TXXX for robust detection
-                if not args.no_embed_uuid:
-                    if embed_mp3_uuid_txxx(mp3_dest, uuid):
-                        print("Embedded UUID (TXXX:SUNO_UUID)")
-                    else:
-                        print("Could not embed UUID TXXX; comment still contains uuid=")
-
-                # Lyrics handling
-                if args.save_lyrics:
-                    if lyrics_text:
-                        try:
-                            (out_dir / 'lyrics').mkdir(exist_ok=True)
-                            (out_dir / 'lyrics' / f"{uuid}.lyrics.txt").write_text(lyrics_text, encoding='utf-8')
-                            print("Saved lyrics sidecar (.lyrics.txt)")
-                        except Exception:
-                            print("Failed to save lyrics sidecar")
-                    if lyrics_lrc:
-                        try:
-                            (out_dir / 'lyrics').mkdir(exist_ok=True)
-                            (out_dir / 'lyrics' / f"{uuid}.lrc").write_text(lyrics_lrc, encoding='utf-8')
-                            print("Saved LRC sidecar (.lrc)")
-                        except Exception:
-                            print("Failed to save LRC sidecar")
-
-                if args.embed_lyrics and lyrics_text:
-                    print("Embedding lyrics into MP3 (USLT)...")
-                    if embed_mp3_lyrics_uslt(mp3_dest, lyrics_text):
-                        print("Lyrics embedded")
-                    else:
-                        print("Lyrics embedding failed")
-
-            # MP4
-            if want_mp4:
-                mp4_name = f"{base_stem}.mp4"
-                mp4_dest = out_dir / mp4_name
-                # If we have auth and user requested waiting, try to generate MP4 like WAV
-                if not mp4_dest.exists() and headers and args.wait:
-                    ok_gen = trigger_mp4_and_wait(uuid, mp4_dest, headers, args.poll_interval, args.poll_timeout)
-                    if ok_gen:
-                        print(f"MP4 saved: {mp4_dest.name}")
-                # If still not present, try direct download (in case it's already available publicly)
-                if not mp4_dest.exists():
-                    if download(mp4_url, mp4_dest):
-                        print(f"MP4 saved: {mp4_dest.name}")
-                    else:
-                        print("MP4 download failed")
-                # Write simple metadata including UUID in comment
-                if not args.no_embed_uuid:
-                    if embed_simple_metadata(args.ffmpeg_path, mp4_dest, {"title": title, "artist": artist or 'Suno', "comment": comment}):
-                        print("MP4 metadata updated with UUID")
-                    else:
-                        print("MP4 metadata update failed")
-
-            # WAV
-            if want_wav:
-                if not headers:
-                    print("WAV requested but no Studio auth provided; skipping")
+                    print("MP3 download failed; continuing")
+                    continue
+            if not args.no_embed:
+                # Cover sidecar
+                cover_path = out_dir / f"{uuid}.jpeg"
+                if not cover_path.exists():
+                    download(cover_url, cover_path)
+                print("Embedding MP3 metadata and cover...")
+                if embed_mp3(args.ffmpeg_path, mp3_dest, cover_path if cover_path.exists() else None, title, artist or 'Suno', comment):
+                    print("MP3 tagging complete")
                 else:
-                    wav_name = f"{stem}.wav"
-                    wav_dest = out_dir / wav_name
-                    if wav_dest.exists():
-                        print(f"Skipping existing WAV: {wav_dest.name}")
-                    else:
-                        ok = trigger_wav_and_wait(uuid, wav_dest, headers, args.poll_interval, args.poll_timeout)
-                        if ok:
-                            print(f"WAV saved: {wav_dest.name}")
-                            # Add simple metadata with UUID in comment
-                            if not args.no_embed_uuid:
-                                if embed_simple_metadata(args.ffmpeg_path, wav_dest, {"title": title, "artist": artist or 'Suno', "comment": comment}):
-                                    print("WAV metadata updated with UUID")
-                                else:
-                                    print("WAV metadata update failed")
-                        else:
-                            print("WAV was not obtained")
+                    print("MP3 tagging failed")
 
-            # Save details JSON sidecar for traceability
-            if details:
-                try:
-                    (out_dir / 'metadata').mkdir(exist_ok=True)
-                    with open(out_dir / 'metadata' / f"{uuid}.json", 'w', encoding='utf-8') as jf:
-                        json.dump(details, jf, indent=2, ensure_ascii=False)
-                except Exception:
-                    pass
+            # Embed UUID via TXXX for robust detection
+            if not args.no_embed_uuid:
+                if embed_mp3_uuid_txxx(mp3_dest, uuid):
+                    print("Embedded UUID (TXXX:SUNO_UUID)")
+                else:
+                    print("Could not embed UUID TXXX; comment still contains uuid=")
+
+            # Lyrics handling
+            if args.save_lyrics:
+                if lyrics_text:
+                    try:
+                        (out_dir / 'lyrics').mkdir(exist_ok=True)
+                        (out_dir / 'lyrics' / f"{uuid}.lyrics.txt").write_text(lyrics_text, encoding='utf-8')
+                        print("Saved lyrics sidecar (.lyrics.txt)")
+                    except Exception:
+                        print("Failed to save lyrics sidecar")
+                if lyrics_lrc:
+                    try:
+                        (out_dir / 'lyrics').mkdir(exist_ok=True)
+                        (out_dir / 'lyrics' / f"{uuid}.lrc").write_text(lyrics_lrc, encoding='utf-8')
+                        print("Saved LRC sidecar (.lrc)")
+                    except Exception:
+                        print("Failed to save LRC sidecar")
+
+            if args.embed_lyrics and lyrics_text:
+                print("Embedding lyrics into MP3 (USLT)...")
+                if embed_mp3_lyrics_uslt(mp3_dest, lyrics_text):
+                    print("Lyrics embedded")
+                else:
+                    print("Lyrics embedding failed")
+
+        # MP4
+        if want_mp4:
+            mp4_name = f"{base_stem}.mp4"
+            mp4_dest = out_dir / mp4_name
+            # If we have auth and user requested waiting, try to generate MP4 like WAV
+            if not mp4_dest.exists() and headers and args.wait:
+                ok_gen = trigger_mp4_and_wait(uuid, mp4_dest, headers, args.poll_interval, args.poll_timeout)
+                if ok_gen:
+                    print(f"MP4 saved: {mp4_dest.name}")
+            # If still not present, try direct download (in case it's already available publicly)
+            if not mp4_dest.exists():
+                if download(mp4_url, mp4_dest):
+                    print(f"MP4 saved: {mp4_dest.name}")
+                else:
+                    print("MP4 download failed")
+            # Write simple metadata including UUID in comment
+            if not args.no_embed_uuid:
+                if embed_simple_metadata(args.ffmpeg_path, mp4_dest, {"title": title, "artist": artist or 'Suno', "comment": comment}):
+                    print("MP4 metadata updated with UUID")
+                else:
+                    print("MP4 metadata update failed")
+
+        # WAV
+        if want_wav:
+            if not headers:
+                print("WAV requested but no Studio auth provided; skipping")
+            else:
+                wav_name = f"{stem}.wav"
+                wav_dest = out_dir / wav_name
+                if wav_dest.exists():
+                    print(f"Skipping existing WAV: {wav_dest.name}")
+                else:
+                    ok = trigger_wav_and_wait(uuid, wav_dest, headers, args.poll_interval, args.poll_timeout)
+                    if ok:
+                        print(f"WAV saved: {wav_dest.name}")
+                        # Add simple metadata with UUID in comment
+                        if not args.no_embed_uuid:
+                            if embed_simple_metadata(args.ffmpeg_path, wav_dest, {"title": title, "artist": artist or 'Suno', "comment": comment}):
+                                print("WAV metadata updated with UUID")
+                            else:
+                                print("WAV metadata update failed")
+                    else:
+                        print("WAV was not obtained")
+
+        # Save details JSON sidecar for traceability
+        if details:
+            try:
+                (out_dir / 'metadata').mkdir(exist_ok=True)
+                with open(out_dir / 'metadata' / f"{uuid}.json", 'w', encoding='utf-8') as jf:
+                    json.dump(details, jf, indent=2, ensure_ascii=False)
+            except Exception:
+                pass
 
     print(f"\nDone. Output: {out_dir}")
 
