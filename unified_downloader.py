@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Unified Suno downloader/embeder
+Unified Suno downloader/embedder
 - Reads lines: "FILENAME|URL" (URL is usually https://cdn1.suno.ai/{uuid}.mp3 or .mp4)
 - For each UUID, fetches song details from oEmbed (preferred) or the song page as fallback
-- Downloads requested formats: mp3/mp4 directly; wav via Studio API (optional, requires browser auth)
+- Downloads requested formats:
+  - mp3: direct from CDN when available
+  - mp4: requires Studio auth and may need generation; will probe/generate if direct URL is not available
+  - wav: requires Studio auth and may need generation; will probe/generate if direct URL is not available
 - Embeds into MP3 by default: cover, title, artist, comment (caption/prompt/tags/model info)
-- Saves sidecars: details JSON and lyrics (if found in details)
+- Saves sidecars: details JSON
 - WAV: sets only simple metadata feasible (INFO tags are limited); no cover embedding
 
 Notes:
-- Requires Python 3 and requests. ffmpeg is required for MP3 cover embedding.
-- Lyrics embedding (USLT) is not enabled by default; sidecars are saved when available.
+- Requires Python 3 and requests. ffmpeg is required for MP3 cover embedding and for simple metadata updates.
 """
 
 import argparse
@@ -26,7 +28,7 @@ from typing import Dict, Optional, Tuple
 
 import requests
 try:
-    from mutagen.id3 import ID3, USLT, TXXX
+    from mutagen.id3 import ID3, TXXX
     MUTAGEN_AVAILABLE = True
 except Exception:
     MUTAGEN_AVAILABLE = False
@@ -67,60 +69,7 @@ def run_ffmpeg(cmd: list[str]) -> bool:
         return False
 
 
-def embed_mp3_lyrics_uslt(mp3_path: Path, lyrics_text: str, lang: str = "eng") -> bool:
-    if not MUTAGEN_AVAILABLE:
-        print("Lyrics embed requested but mutagen is not installed. pip install mutagen")
-        return False
-    try:
-        tags = ID3(str(mp3_path))
-    except Exception:
-        # Create tags if missing
-        tags = ID3()
-    try:
-        # Replace or add a generic USLT frame
-        tags.add(USLT(encoding=3, lang=lang, desc="", text=lyrics_text))
-        tags.save(str(mp3_path))
-        return True
-    except Exception as e:
-        print(f"Failed to embed lyrics: {e}")
-        return False
 
-
-def pick_lyrics_from_details(details: Dict) -> Tuple[Optional[str], Optional[str]]:
-    """Return (plain_text, lrc_text) if found in details structures.
-    Supports a few common keys: 'lyrics', 'lyric', 'lrc', 'timestamped_lyrics', 'lyrics_lrc'.
-    """
-    if not details:
-        return None, None
-    # Normalize to inner data
-    data = details.get('data', details)
-    clip = data.get('clip') if isinstance(data, dict) else None
-    sources = []
-    if clip and isinstance(clip, dict):
-        sources.append(clip)
-        md = clip.get('metadata', {}) if isinstance(clip.get('metadata', {}), dict) else {}
-        sources.append(md)
-    if isinstance(data, dict):
-        sources.append(data)
-
-    plain = None
-    lrc = None
-    keys_plain = ["lyrics", "lyric", "lyrics_text", "plain_lyrics"]
-    keys_lrc = ["lrc", "timestamped_lyrics", "lyrics_lrc"]
-    for src in sources:
-        if not isinstance(src, dict):
-            continue
-        for k in keys_plain:
-            val = src.get(k)
-            if isinstance(val, str) and val.strip():
-                plain = val.strip()
-                break
-        for k in keys_lrc:
-            val = src.get(k)
-            if isinstance(val, str) and val.strip():
-                lrc = val.strip()
-                break
-    return plain, lrc
 
 
 def embed_mp3_uuid_txxx(mp3_path: Path, uuid: str) -> bool:
@@ -204,39 +153,10 @@ def download(url: str, dest: Path) -> bool:
         return False
 
 
-def fetch_lyrics_external(uuid: str, log_prefix: str = "[lyrics] ") -> Tuple[Optional[str], Optional[str]]:
-    """Try public Studio endpoints (no auth) to find lyrics. Returns (plain, lrc).
-    Order: clip -> gen -> song (kept for future reference/use).
-    """
-    candidates = [
-        f"{STUDIO_BASE}/api/clip/{uuid}",
-        f"{STUDIO_BASE}/api/gen/{uuid}",
-        f"{STUDIO_BASE}/api/song/{uuid}",
-    ]
-    for ep in candidates:
-        try:
-            print(f"{log_prefix}GET {ep}")
-            r = requests.get(ep, timeout=30)
-            print(f"{log_prefix}-> {r.status_code}")
-            if r.status_code // 100 != 2:
-                continue
-            try:
-                data = r.json()
-            except Exception as e:
-                print(f"{log_prefix}JSON parse failed: {e}")
-                continue
-            plain, lrc = pick_lyrics_from_details(data)
-            if plain or lrc:
-                print(f"{log_prefix}Found lyrics from {ep}")
-                return plain, lrc
-        except requests.RequestException as e:
-            print(f"{log_prefix}Request error: {e}")
-            continue
-    print(f"{log_prefix}No lyrics found via public endpoints")
-    return None, None
 
 
- 
+
+
 
 
 def fetch_details_oembed(song_uuid: str) -> Optional[Dict]:
@@ -403,27 +323,27 @@ def trigger_mp4_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], pol
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Unified Suno downloader/embeder")
-    parser.add_argument("--songfile", required=True, help="Input file with lines: FILENAME|URL")
-    parser.add_argument("--formats", default="mp3", help="Comma list: mp3,mp4,wav")
-    parser.add_argument("--output-dir", help="Destination directory (default: {songfile}_files)")
-    parser.add_argument("--details-dir", help="Directory with per-uuid JSON details to enrich tags")
-    parser.add_argument("--no-embed", action="store_true", help="Skip MP3 art embedding/metadata writing")
-    parser.add_argument("--embed-lyrics", action="store_true", help="Embed lyrics into MP3 (ID3 USLT via mutagen)")
-    parser.add_argument("--save-lyrics", action="store_true", help="Save lyrics sidecars (.lyrics.txt and/or .lrc) when found")
-    parser.add_argument("--no-external-lyrics", dest="no_external_lyrics", action="store_true", help="Do not fetch lyrics from public Studio endpoints")
-    parser.add_argument("--no-auth-lyrics", dest="no_external_lyrics", action="store_true", help="[deprecated] Same as --no-external-lyrics")
-    parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Path to ffmpeg")
-    parser.add_argument("--no-embed-uuid", action="store_true", help="Do not embed UUID into metadata (default embeds)")
-    parser.add_argument("--name-mode", choices=["input", "details", "uuid"], default="input", help="How to choose base filename when title missing or to override")
-    # WAV / Studio
-    parser.add_argument("--auth-bearer", help="Studio Authorization Bearer token for WAV")
-    parser.add_argument("--session-id")
-    parser.add_argument("--browser-token")
-    parser.add_argument("--device-id")
-    parser.add_argument("--wait", action="store_true", help="When WAV requested, wait until downloadable")
-    parser.add_argument("--poll-interval", type=int, default=10)
-    parser.add_argument("--poll-timeout", type=int, default=300)
+    parser = argparse.ArgumentParser(description="Unified Suno downloader/embedder")
+    parser.add_argument("--songfile", required=True, help="[required] Input file with lines: FILENAME|URL")
+    parser.add_argument("--formats", default="mp3", help="[optional] Comma list: mp3,mp4,wav (default: mp3)")
+    parser.add_argument("--output-dir", help="[optional] Destination directory (default: {songfile}_files)")
+    parser.add_argument("--wait", action="store_true", help="[optional] When WAV or MP4 requested, wait until downloadable (trigger and poll if needed)")
+    parser.add_argument("--no-metadata", action="store_true", help="[optional] Skip metadata writing (cover/art and tags)")
+    parser.add_argument("--auth", help="[optional] Authorization Bearer token for WAV/MP4 generation")
+
+    parser.add_argument("--details-dir", help="[optional] Directory with per-uuid JSON details to enrich tags")
+
+    parser.add_argument("--poll-interval", type=int, default=10, help="[optional] Poll interval (seconds) for WAV/MP4 generation (default: 10)")
+    parser.add_argument("--poll-timeout", type=int, default=300, help="[optional] Poll timeout (seconds) for WAV/MP4 generation (default: 300)")
+
+    parser.add_argument("--ffmpeg-path", default="ffmpeg", help="[optional] Path to ffmpeg (used for tagging and metadata)")
+    parser.add_argument("--name-mode", choices=["input", "details", "uuid"], default="input", help="[optional] How to choose base filename when title missing or to override (default: input)")
+    parser.add_argument("--no-embed-uuid", action="store_true", help="[optional] Do not embed UUID into metadata (embeds by default)")
+
+    parser.add_argument("--session-id", help="[optional] Studio session-id header for WAV/MP4 generation")
+    parser.add_argument("--browser-token", help="[optional] Studio browser-token header for WAV/MP4 generation")
+    parser.add_argument("--device-id", help="[optional] Studio device-id header for WAV/MP4 generation")
+
 
     args = parser.parse_args()
 
@@ -442,10 +362,10 @@ def main():
     want_mp4 = 'mp4' in want
     want_wav = 'wav' in want
 
-    # Prepare Studio headers if provided (used for WAV and MP4 triggers)
+    # Prepare auth headers if provided (used for WAV and MP4 triggers)
     headers = {}
-    if args.auth_bearer:
-        headers = {"Authorization": f"Bearer {args.auth_bearer}", "Accept": "*/*"}
+    if args.auth:
+        headers = {"Authorization": f"Bearer {args.auth}", "Accept": "*/*"}
         if args.session_id:
             headers["session-id"] = args.session_id
         if args.browser_token:
@@ -572,14 +492,6 @@ def main():
         # Prepend UUID to comment for broad containers
         base_comment = ' | '.join([p for p in comment_parts if p])
         comment = f"uuid={uuid}" + (f" | {base_comment}" if base_comment else "")
-        # Lyrics
-        lyrics_text, lyrics_lrc = pick_lyrics_from_details(details)
-        # If not present, try public Studio endpoints (no auth)
-        if not args.no_external_lyrics and (not lyrics_text and not lyrics_lrc):
-            e_plain, e_lrc = fetch_lyrics_external(uuid)
-            if e_plain or e_lrc:
-                lyrics_text = lyrics_text or e_plain
-                lyrics_lrc = lyrics_lrc or e_lrc
 
         # Prepare canonical URLs for formats based on UUID
         url_is_mp3 = url.lower().endswith('.mp3')
@@ -599,7 +511,7 @@ def main():
                 else:
                     print("MP3 download failed; continuing")
                     continue
-            if not args.no_embed:
+            if not args.no_metadata:
                 # Cover sidecar
                 cover_path = out_dir / f"{uuid}.jpeg"
                 if not cover_path.exists():
@@ -617,29 +529,7 @@ def main():
                 else:
                     print("Could not embed UUID TXXX; comment still contains uuid=")
 
-            # Lyrics handling
-            if args.save_lyrics:
-                if lyrics_text:
-                    try:
-                        (out_dir / 'lyrics').mkdir(exist_ok=True)
-                        (out_dir / 'lyrics' / f"{uuid}.lyrics.txt").write_text(lyrics_text, encoding='utf-8')
-                        print("Saved lyrics sidecar (.lyrics.txt)")
-                    except Exception:
-                        print("Failed to save lyrics sidecar")
-                if lyrics_lrc:
-                    try:
-                        (out_dir / 'lyrics').mkdir(exist_ok=True)
-                        (out_dir / 'lyrics' / f"{uuid}.lrc").write_text(lyrics_lrc, encoding='utf-8')
-                        print("Saved LRC sidecar (.lrc)")
-                    except Exception:
-                        print("Failed to save LRC sidecar")
 
-            if args.embed_lyrics and lyrics_text:
-                print("Embedding lyrics into MP3 (USLT)...")
-                if embed_mp3_lyrics_uslt(mp3_dest, lyrics_text):
-                    print("Lyrics embedded")
-                else:
-                    print("Lyrics embedding failed")
 
         # MP4
         if want_mp4:
