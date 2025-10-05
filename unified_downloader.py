@@ -189,16 +189,15 @@ def download(url: str, dest: Path) -> bool:
         return False
 
 
-def fetch_lyrics_external(uuid: str, endpoints: Tuple[str, ...], log_prefix: str = "[lyrics] ") -> Tuple[Optional[str], Optional[str]]:
-    """Try selected public Studio endpoints (no auth) to find lyrics. Returns (plain, lrc).
-    endpoints: tuple of names among ('clip','gen','song')
+def fetch_lyrics_external(uuid: str, log_prefix: str = "[lyrics] ") -> Tuple[Optional[str], Optional[str]]:
+    """Try public Studio endpoints (no auth) to find lyrics. Returns (plain, lrc).
+    Order: clip -> gen -> song (kept for future reference/use).
     """
-    url_map = {
-        'clip': f"{STUDIO_BASE}/api/clip/{uuid}",
-        'gen': f"{STUDIO_BASE}/api/gen/{uuid}",
-        'song': f"{STUDIO_BASE}/api/song/{uuid}",
-    }
-    candidates = [url_map[name] for name in endpoints if name in url_map]
+    candidates = [
+        f"{STUDIO_BASE}/api/clip/{uuid}",
+        f"{STUDIO_BASE}/api/gen/{uuid}",
+        f"{STUDIO_BASE}/api/song/{uuid}",
+    ]
     for ep in candidates:
         try:
             print(f"{log_prefix}GET {ep}")
@@ -222,43 +221,7 @@ def fetch_lyrics_external(uuid: str, endpoints: Tuple[str, ...], log_prefix: str
     return None, None
 
 
-def extract_core_fields(details: Dict, uuid: str, default_title: str, default_cover: str) -> Tuple[str, str, str, list[str]]:
-    """Normalize fields (title, artist, cover, comment_parts) from details.
-    Falls back to defaults when absent.
-    """
-    title = default_title
-    artist = ''
-    cover_url = default_cover
-    comment_parts: list[str] = []
-    if details:
-        data = details.get('data', details)
-        clip = data.get('clip') if isinstance(data, dict) else None
-        if clip:
-            title = clip.get('title') or title
-            artist = f"{clip.get('display_name','')} (@{clip.get('handle','')})".strip()
-            cover_url = clip.get('image_large_url') or clip.get('image_url') or cover_url
-            md = clip.get('metadata', {}) if isinstance(clip.get('metadata', {}), dict) else {}
-            prompt = md.get('prompt')
-            tags_long = md.get('tags')
-            display_tags = clip.get('display_tags')
-            model = f"{clip.get('major_model_version','')} {clip.get('model_name','')}".strip()
-            dur = md.get('duration')
-            if prompt:
-                comment_parts.append(f"prompt: {prompt}")
-            if display_tags:
-                comment_parts.append(f"tags: {display_tags}")
-            elif isinstance(tags_long, str) and tags_long:
-                comment_parts.append(f"tags: {tags_long[:120]}")
-            if model:
-                comment_parts.append(f"model: {model}")
-            if dur:
-                comment_parts.append(f"duration: {dur}s")
-        else:
-            # oEmbed path
-            title = data.get('title') or title
-            artist = data.get('author_name') or artist
-            cover_url = data.get('thumbnail_url') or cover_url
-    return title, artist, cover_url, comment_parts
+ 
 
 
 def fetch_details_oembed(song_uuid: str) -> Optional[Dict]:
@@ -346,9 +309,8 @@ def embed_mp3(ffmpeg_path: str, mp3_path: Path, cover_path: Optional[Path], titl
         return False
 
 
-def trigger_wav_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], poll_interval: int, poll_timeout: int, probe_template: str, probe_method: str) -> bool:
+def trigger_wav_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], poll_interval: int, poll_timeout: int) -> bool:
     endpoint = f"{STUDIO_BASE}/api/gen/{uuid}/convert_wav/"
-    # Trigger once via API
     try:
         r = requests.post(endpoint, headers=headers, timeout=60)
         if r.status_code // 100 != 2:
@@ -358,28 +320,70 @@ def trigger_wav_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], pol
         print(f"❌ WAV trigger error: {e}")
         return False
 
-    # Only probe the CDN URL until available
     start = time.time()
     attempt = 1
-    print("⏳ Waiting for WAV (CDN probe only)...")
-    probe_url = probe_template.format(uuid=uuid)
+    print("⏳ Waiting for WAV...")
     while time.time() - start < poll_timeout:
         time.sleep(poll_interval)
+        # Try re-post (some sessions surface URL there)
         try:
-            if probe_method == "HEAD":
-                pr = requests.head(probe_url, timeout=15, allow_redirects=True)
-            else:
-                pr = requests.get(probe_url, timeout=15, stream=True)
-            elapsed = int(time.time() - start)
-            print(f"[probe #{attempt}] +{elapsed}s status={pr.status_code}")
+            r2 = requests.post(endpoint, headers=headers, timeout=60)
+            if r2.status_code // 100 == 2:
+                try:
+                    body = r2.json()
+                    dl_url = (
+                        body.get('audioWavUrl')
+                        or body.get('data', {}).get('audioWavUrl')
+                        or body.get('download_url')
+                        or body.get('data', {}).get('download_url')
+                    )
+                except Exception:
+                    dl_url = None
+                if dl_url:
+                    print("⬇️ WAV URL ready; downloading...")
+                    return download(dl_url, out_path)
+        except requests.RequestException:
+            pass
+        # Probe fixed CDN URL without exposing options in CLI
+        probe_url = f"{CDN_AUDIO}/{uuid}.wav"
+        try:
+            pr = requests.head(probe_url, timeout=15, allow_redirects=True)
             if pr.status_code == 200:
                 print("⬇️ WAV probe succeeded; downloading...")
                 return download(probe_url, out_path)
-        except requests.RequestException as e:
-            elapsed = int(time.time() - start)
-            print(f"[probe error +{elapsed}s] {e}")
+        except requests.RequestException:
+            pass
         attempt += 1
     print("⏰ WAV timeout")
+    return False
+
+
+def trigger_mp4_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], poll_interval: int, poll_timeout: int) -> bool:
+    endpoint = f"{STUDIO_BASE}/api/video/generate/{uuid}/"
+    try:
+        r = requests.post(endpoint, headers=headers, timeout=60)
+        print(f"🎬 MP4 generate -> {r.status_code}")
+        if r.status_code // 100 not in (2,):
+            # 204 No Content is typical on success
+            return False
+    except requests.RequestException as e:
+        print(f"❌ MP4 trigger error: {e}")
+        return False
+
+    start = time.time()
+    print("⏳ Waiting for MP4...")
+    while time.time() - start < poll_timeout:
+        time.sleep(poll_interval)
+        # Probe fixed CDN URL
+        probe_url = f"{CDN_AUDIO}/{uuid}.mp4"
+        try:
+            pr = requests.head(probe_url, timeout=15, allow_redirects=True)
+            if pr.status_code == 200:
+                print("⬇️ MP4 probe succeeded; downloading...")
+                return download(probe_url, out_path)
+        except requests.RequestException:
+            pass
+    print("⏰ MP4 timeout")
     return False
 
 
@@ -393,45 +397,20 @@ def main():
     parser.add_argument("--embed-lyrics", action="store_true", help="Embed lyrics into MP3 (ID3 USLT via mutagen)")
     parser.add_argument("--save-lyrics", action="store_true", help="Save lyrics sidecars (.lyrics.txt and/or .lrc) when found")
     parser.add_argument("--no-external-lyrics", dest="no_external_lyrics", action="store_true", help="Do not fetch lyrics from public Studio endpoints")
-    parser.add_argument("--lyrics-endpoints", default="clip", help="Comma list of endpoints to query for lyrics: clip,gen,song (default: clip)")
-    parser.add_argument("--log-file", help="Tee console logs to this file")
+    parser.add_argument("--no-auth-lyrics", dest="no_external_lyrics", action="store_true", help="[deprecated] Same as --no-external-lyrics")
     parser.add_argument("--ffmpeg-path", default="ffmpeg", help="Path to ffmpeg")
     parser.add_argument("--no-embed-uuid", action="store_true", help="Do not embed UUID into metadata (default embeds)")
     parser.add_argument("--name-mode", choices=["input", "details", "uuid"], default="input", help="How to choose base filename when title missing or to override")
     # WAV / Studio
     parser.add_argument("--auth-bearer", help="Studio Authorization Bearer token for WAV")
-    parser.add_argument("--session-id", help="[advanced] Optional Studio session-id header")
-    parser.add_argument("--browser-token", help="[advanced] Optional Studio browser-token header (JSON string)")
-    parser.add_argument("--device-id", help="[advanced] Optional Studio device-id header")
+    parser.add_argument("--session-id")
+    parser.add_argument("--browser-token")
+    parser.add_argument("--device-id")
     parser.add_argument("--wait", action="store_true", help="When WAV requested, wait until downloadable")
-    parser.add_argument("--poll-interval", type=int, default=3)
+    parser.add_argument("--poll-interval", type=int, default=10)
     parser.add_argument("--poll-timeout", type=int, default=300)
-    parser.add_argument("--wav-url-template", default="https://cdn1.suno.ai/{uuid}.wav")
-    parser.add_argument("--probe-http-method", choices=["HEAD", "GET"], default="HEAD")
 
     args = parser.parse_args()
-
-    # Optional: tee all prints to a log file
-    log_fp = None
-    if args.log_file:
-        try:
-            import builtins
-            original_print = print
-            log_fp = open(args.log_file, 'a', encoding='utf-8')
-            def tee_print(*pargs, **pkwargs):
-                original_print(*pargs, **pkwargs)
-                try:
-                    text = " ".join(str(a) for a in pargs)
-                    if not text.endswith("\n"):
-                        text += "\n"
-                    log_fp.write(text)
-                    log_fp.flush()
-                except Exception:
-                    pass
-            builtins.print = tee_print
-            print(f"[log] Tee logging to {args.log_file}")
-        except Exception as e:
-            print(f"[log] Failed to set up log tee: {e}")
 
     in_path = Path(args.songfile)
     if not in_path.exists():
@@ -448,9 +427,9 @@ def main():
     want_mp4 = 'mp4' in want
     want_wav = 'wav' in want
 
-    # Prepare Studio headers if WAV
+    # Prepare Studio headers if provided (used for WAV and MP4 triggers)
     headers = {}
-    if want_wav and args.auth_bearer:
+    if args.auth_bearer:
         headers = {"Authorization": f"Bearer {args.auth_bearer}", "Accept": "*/*"}
         if args.session_id:
             headers["session-id"] = args.session_id
@@ -500,20 +479,53 @@ def main():
                 filename = (left or uuid) + ext
 
             stem = Path(filename).stem
+            base_stem = stem
             print(f"\n=== {filename} (uuid={uuid}) ===")
 
-            # Skip if a file with same UUID already present (MP3 scan)
-            if any_file_with_uuid(out_dir, uuid):
-                print("Found existing file with same UUID in output. Skipping downloads for this entry.")
-                continue
+            # Check for existing MP3 with same UUID, but don't skip other formats
+            already_have_uuid = any_file_with_uuid(out_dir, uuid)
+            if already_have_uuid:
+                print("Found existing MP3 with same UUID; will skip MP3 but still process other formats.")
 
             # Gather details (already fetched above if needed)
             if not details:
                 details = collect_song_fields(uuid, details_dir)
-            # Normalize fields for tagging via helper
-            title, artist, cover_url, comment_parts = extract_core_fields(
-                details, uuid, stem, build_cover_url(uuid)
-            )
+            # Normalize fields for tagging
+            title = stem
+            artist = ''
+            cover_url = build_cover_url(uuid)
+            comment_parts = []
+
+            if details:
+                src = details.get('source')
+                data = details.get('data', {}) if 'data' in details else details
+                # Page clip path
+                clip = data.get('clip') if 'clip' in data else None
+                if clip:
+                    title = clip.get('title') or title
+                    artist = f"{clip.get('display_name','')} (@{clip.get('handle','')})".strip()
+                    cover_url = clip.get('image_large_url') or clip.get('image_url') or cover_url
+                    md = clip.get('metadata', {})
+                    prompt = md.get('prompt')
+                    tags_long = md.get('tags')
+                    display_tags = clip.get('display_tags')
+                    model = f"{clip.get('major_model_version','')} {clip.get('model_name','')}".strip()
+                    dur = md.get('duration')
+                    if prompt:
+                        comment_parts.append(f"prompt: {prompt}")
+                    if display_tags:
+                        comment_parts.append(f"tags: {display_tags}")
+                    elif tags_long:
+                        comment_parts.append(f"tags: {tags_long[:120]}")
+                    if model:
+                        comment_parts.append(f"model: {model}")
+                    if dur:
+                        comment_parts.append(f"duration: {dur}s")
+                else:
+                    # oEmbed may have title/author_name/thumbnail_url
+                    title = data.get('title') or title
+                    artist = data.get('author_name') or artist
+                    cover_url = data.get('thumbnail_url') or cover_url
 
             # Prepend UUID to comment for broad containers
             base_comment = ' | '.join([p for p in comment_parts if p])
@@ -522,17 +534,25 @@ def main():
             lyrics_text, lyrics_lrc = pick_lyrics_from_details(details)
             # If not present, try public Studio endpoints (no auth)
             if not args.no_external_lyrics and (not lyrics_text and not lyrics_lrc):
-                ep_names = tuple(s.strip().lower() for s in args.lyrics_endpoints.split(',') if s.strip())
-                e_plain, e_lrc = fetch_lyrics_external(uuid, ep_names)
+                e_plain, e_lrc = fetch_lyrics_external(uuid)
                 if e_plain or e_lrc:
                     lyrics_text = lyrics_text or e_plain
                     lyrics_lrc = lyrics_lrc or e_lrc
 
+            # Prepare canonical URLs for formats based on UUID
+            url_is_mp3 = url.lower().endswith('.mp3')
+            url_is_mp4 = url.lower().endswith('.mp4')
+            mp3_url = url if url_is_mp3 else f"{CDN_AUDIO}/{uuid}.mp3"
+            mp4_url = url if url_is_mp4 else f"{CDN_AUDIO}/{uuid}.mp4"
+
             # MP3
-            if want_mp3 and filename.lower().endswith('.mp3'):
-                mp3_dest = out_dir / filename
-                if not mp3_dest.exists():
-                    if download(url, mp3_dest):
+            if want_mp3:
+                if already_have_uuid:
+                    pass
+                mp3_name = f"{base_stem}.mp3"
+                mp3_dest = out_dir / mp3_name
+                if not mp3_dest.exists() and not already_have_uuid:
+                    if download(mp3_url, mp3_dest):
                         print(f"MP3 saved: {mp3_dest.name}")
                     else:
                         print("MP3 download failed; continuing")
@@ -580,10 +600,17 @@ def main():
                         print("Lyrics embedding failed")
 
             # MP4
-            if want_mp4 and filename.lower().endswith('.mp4'):
-                mp4_dest = out_dir / filename
+            if want_mp4:
+                mp4_name = f"{base_stem}.mp4"
+                mp4_dest = out_dir / mp4_name
+                # If we have auth and user requested waiting, try to generate MP4 like WAV
+                if not mp4_dest.exists() and headers and args.wait:
+                    ok_gen = trigger_mp4_and_wait(uuid, mp4_dest, headers, args.poll_interval, args.poll_timeout)
+                    if ok_gen:
+                        print(f"MP4 saved: {mp4_dest.name}")
+                # If still not present, try direct download (in case it's already available publicly)
                 if not mp4_dest.exists():
-                    if download(url, mp4_dest):
+                    if download(mp4_url, mp4_dest):
                         print(f"MP4 saved: {mp4_dest.name}")
                     else:
                         print("MP4 download failed")
@@ -604,7 +631,7 @@ def main():
                     if wav_dest.exists():
                         print(f"Skipping existing WAV: {wav_dest.name}")
                     else:
-                        ok = trigger_wav_and_wait(uuid, wav_dest, headers, args.poll_interval, args.poll_timeout, args.wav_url_template, args.probe_http_method)
+                        ok = trigger_wav_and_wait(uuid, wav_dest, headers, args.poll_interval, args.poll_timeout)
                         if ok:
                             print(f"WAV saved: {wav_dest.name}")
                             # Add simple metadata with UUID in comment
@@ -626,11 +653,6 @@ def main():
                     pass
 
     print(f"\nDone. Output: {out_dir}")
-    if log_fp:
-        try:
-            log_fp.close()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":
