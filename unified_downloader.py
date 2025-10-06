@@ -52,6 +52,9 @@ from rich.live import Live
 from rich.text import Text
 from rich.console import Group
 from rich.align import Align
+from rich.layout import Layout
+import concurrent.futures
+from rich.layout import Layout
 RICH_AVAILABLE = True
 console = Console(theme=Theme({
     "info": "cyan",
@@ -577,7 +580,8 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
         if clip:
             title = clip.get('title') or title
             artist = f"{clip.get('display_name','')} (@{clip.get('handle','')})".strip()
-            cover_url = clip.get('image_large_url') or clip.get('image_url') or cover_url
+            # Always prefer the large image; NEVER use smaller thumbnail/image fields
+            cover_url = clip.get('image_large_url') or build_cover_url(uuid)
             md = clip.get('metadata', {})
             prompt = md.get('prompt')
             tags_long = md.get('tags')
@@ -598,7 +602,7 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
             # oEmbed may have title/author_name/thumbnail_url
             title = data.get('title') or title
             artist = data.get('author_name') or artist
-            cover_url = data.get('thumbnail_url') or cover_url
+            # Do NOT use oEmbed thumbnails for cover art; keep using large image URL
 
     # Prepend UUID to comment for broad containers
     base_comment = ' | '.join([p for p in comment_parts if p])
@@ -655,8 +659,8 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
         # Only tag/embed when newly saved this run
         if mp3_just_saved and not args.no_metadata:
             cover_path = out_dir / f"{uuid}.jpeg"
-            if not cover_path.exists():
-                download(cover_url, cover_path)
+            # Always fetch the preferred large image to avoid cached small thumbnails
+            download(cover_url, cover_path)
             print(f"[#{idx} MP3] Embedding metadata and cover...")
             if embed_mp3(args.ffmpeg_path, mp3_dest, cover_path if cover_path.exists() else None, title, artist or 'Suno', comment):
                 print(f"[#{idx} MP3] Tagging complete")
@@ -785,6 +789,7 @@ def main():
     parser.add_argument("--no-embed-uuid", action="store_true", help="[optional] Do not embed UUID into metadata (embeds by default)")
     parser.add_argument("--logs-height", type=int, default=12, help="[optional] Max height (rows) for the Logs panel (default: 12)")
     parser.add_argument("--downloads-height", type=int, default=20, help="[optional] Max height (rows) for the Downloads panel (default: 20)")
+    parser.add_argument("--progress-visible", type=int, default=10, help="[optional] Max number of song progress rows to display at once (default: 10)")
 
     parser.add_argument("--session-id", help="[optional] Studio session-id header for WAV/MP4 generation")
     parser.add_argument("--browser-token", help="[optional] Studio browser-token header for WAV/MP4 generation")
@@ -906,28 +911,32 @@ def main():
         logs_h_eff = max(5, min(args.logs_height, term_h // 2))
         downloads_h_eff = max(5, min(args.downloads_height, term_h - logs_h_eff - 4))
 
-        # Two-panel live view: Logs (top) + Progress (bottom) with constrained heights
-        layout = Group(
-            Panel(Align(LOG_TEXT, vertical="bottom"), title="Logs", expand=False, height=logs_h_eff),
-            Panel(progress, title="Downloads", expand=False, height=downloads_h_eff),
+        # Use Layout to ensure same width panels and separate Active vs Queue
+        layout = Layout()
+        layout.split_column(
+            Layout(name="top", size=logs_h_eff),
+            Layout(name="bottom", size=downloads_h_eff),
+        )
+        layout["bottom"].split_row(
+            Layout(name="left", ratio=3),
+            Layout(name="queue", ratio=1),
+        )
+        # Left side: split into Stats (top) and Active (bottom)
+        stats_height = max(5, min(8, downloads_h_eff // 3))
+        layout["left"].split_column(
+            Layout(name="stats", size=stats_height),
+            Layout(name="active"),
         )
 
-        with Live(layout, refresh_per_second=8, console=console):
-            task_ids = {}
-            for u in order:
-                left, url = unique_map[u]
-                steps = calc_steps()
-                desc = f"Song #{index_map[u]} ({u})"
-                task_id = progress.add_task("song", total=steps, desc=desc)
-                task_ids[u] = task_id
-                futures.append(
-                    executor.submit(
-                        process_one, u, left, url, index_map[u], total_unique,
-                        args, out_dir, details_dir, headers, want_mp3, want_mp4, want_wav,
-                        progress, task_id
-                    )
-                )
+        queue_text = Text()
+        def refresh_queue_text(pending_list: list[str]):
+            queue_text.__init__("\n".join(pending_list))
 
+        layout["top"].update(Panel(Align(LOG_TEXT, vertical="bottom"), title="Logs", expand=True))
+        layout["active"].update(Panel(progress, title="Active", expand=True))
+        layout["queue"].update(Panel(Align(queue_text, vertical="top"), title="Queue", expand=True))
+
+        with Live(layout, refresh_per_second=8, console=console):
             # Aggregates
             agg = {
                 "mp3_saved": 0,
@@ -941,13 +950,103 @@ def main():
                 "wav_failed": 0,
                 "wav_skipped_existing": 0,
             }
-            for fut in as_completed(futures):
-                try:
-                    res = fut.result()
-                    for k in agg:
-                        agg[k] += 1 if res.get(k) else 0
-                except Exception:
-                    pass
+
+            # Helper to build compact stats panel (live updating)
+            def style_count(n: int, kind: str) -> str:
+                if kind == "ok":
+                    return f"[green]{n}[/]" if n > 0 else f"[dim]{n}[/]"
+                if kind == "fail":
+                    return f"[red]{n}[/]" if n > 0 else f"[dim]{n}[/]"
+                if kind == "skip":
+                    return f"[yellow]{n}[/]" if n > 0 else f"[dim]{n}[/]"
+                return str(n)
+
+            def build_stats_panel() -> Panel:
+                t = Text()
+                def add_line(label: str, kind: str, mp3v=None, mp4v=None, wavv=None):
+                    # Label
+                    t.append(label + ": ", style="bold")
+                    parts = []
+                    if want_mp3 and mp3v is not None:
+                        parts.append(("MP3 ", style_count(mp3v or 0, kind)))
+                    if want_mp4 and mp4v is not None:
+                        parts.append(("MP4 ", style_count(mp4v or 0, kind)))
+                    if want_wav and wavv is not None:
+                        parts.append(("WAV ", style_count(wavv or 0, kind)))
+                    # Render parts: label each format with fixed color tag and colored count
+                    first = True
+                    for tag, count_str in parts:
+                        if not first:
+                            t.append("  ")
+                        t.append(tag, style="cyan")
+                        # count_str contains markup like [green]X[/] -> parse as Rich Text
+                        t.append_text(Text.from_markup(count_str))
+                        first = False
+                    t.append("\n")
+
+                add_line("New", "ok",
+                         agg["mp3_saved"] if want_mp3 else None,
+                         agg["mp4_saved"] if want_mp4 else None,
+                         agg["wav_saved"] if want_wav else None)
+                add_line("Fail", "fail",
+                         agg["mp3_failed"] if want_mp3 else None,
+                         agg["mp4_failed"] if want_mp4 else None,
+                         agg["wav_failed"] if want_wav else None)
+                add_line("Skip exist", "skip",
+                         agg["mp3_skipped_existing"] if want_mp3 else None,
+                         agg["mp4_skipped_existing"] if want_mp4 else None,
+                         agg["wav_skipped_existing"] if want_wav else None)
+                if want_mp3:
+                    add_line("Skip dup UUID", "skip", agg["mp3_skipped_uuid"], None, None)
+                return Panel(Align(t, vertical="top"), title="Stats", title_align="left", expand=True)
+
+            # Submit up to max_workers; keep the rest in a pending queue displayed at right
+            pending = deque(order)
+            running: dict[concurrent.futures.Future, int] = {}
+
+            def submit_next(slots: int = 1):
+                nonlocal pending
+                count = 0
+                while pending and count < slots and len(running) < executor._max_workers:
+                    u = pending.popleft()
+                    left, url = unique_map[u]
+                    steps = calc_steps()
+                    desc = f"#{index_map[u]} ({u})"
+                    task_id = progress.add_task("song", total=steps, desc=desc)
+                    fut = executor.submit(
+                        process_one, u, left, url, index_map[u], total_unique,
+                        args, out_dir, details_dir, headers, want_mp3, want_mp4, want_wav,
+                        progress, task_id
+                    )
+                    running[fut] = task_id
+                    count += 1
+                # Refresh queue panel text
+                refresh_queue_text([f"{i+1}. {u}" for i, u in enumerate(pending)])
+
+            # Initial submissions and initial stats render
+            submit_next(slots=executor._max_workers)
+            layout["stats"].update(build_stats_panel())
+
+            # Drive the event loop while there are running tasks
+            while running:
+                done, _ = concurrent.futures.wait(list(running.keys()), timeout=0.25, return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in done:
+                    tid = running.pop(fut)
+                    try:
+                        res = fut.result()
+                        for k in agg:
+                            agg[k] += 1 if res.get(k) else 0
+                    except Exception:
+                        pass
+                    # Remove finished task from Active panel
+                    try:
+                        progress.remove_task(tid)
+                    except Exception:
+                        progress.update(tid, visible=False)
+                    # Submit one more from queue
+                    submit_next(slots=1)
+                    # Update stats panel
+                    layout["stats"].update(build_stats_panel())
 
     # Timing end
     elapsed = time.time() - t_start
