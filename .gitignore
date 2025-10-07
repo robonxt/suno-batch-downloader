@@ -1,3 +1,5 @@
 # Ignore audio files (as requested)
 *.mp3
 **/*_files*/
+*/tests/
+*.tmp
