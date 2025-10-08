@@ -932,7 +932,23 @@ def main():
         def refresh_queue_text(pending_list: list[str]):
             queue_text.__init__("\n".join(pending_list))
 
-        layout["top"].update(Panel(Align(LOG_TEXT, vertical="bottom"), title="Logs", expand=True))
+        # Render only the most recent log lines that can fit into the logs panel height.
+        def build_logs_panel(max_rows: int) -> Panel:
+            # Deduct some space for panel title/borders and keep a safe minimum
+            visible_rows = max(3, max_rows - 2)
+            text = Text()
+            with LOG_LOCK:
+                # Take the last N lines for display
+                recent = list(LOG_LINES)[-visible_rows:]
+            first = True
+            for t in recent:
+                if not first:
+                    text.append("\n")
+                text.append_text(t)
+                first = False
+            return Panel(Align(text, vertical="bottom"), title="Logs", expand=True)
+
+        layout["top"].update(build_logs_panel(logs_h_eff))
         layout["active"].update(Panel(progress, title="Active", expand=True))
         layout["queue"].update(Panel(Align(queue_text, vertical="top"), title="Queue", expand=True))
 
@@ -1030,6 +1046,8 @@ def main():
             # Drive the event loop while there are running tasks
             while running:
                 done, _ = concurrent.futures.wait(list(running.keys()), timeout=0.25, return_when=concurrent.futures.FIRST_COMPLETED)
+                # Refresh logs panel to keep view pinned to latest entries
+                layout["top"].update(build_logs_panel(logs_h_eff))
                 for fut in done:
                     tid = running.pop(fut)
                     try:
@@ -1047,6 +1065,8 @@ def main():
                     submit_next(slots=1)
                     # Update stats panel
                     layout["stats"].update(build_stats_panel())
+                    # Refresh logs after updates too
+                    layout["top"].update(build_logs_panel(logs_h_eff))
 
     # Timing end
     elapsed = time.time() - t_start
