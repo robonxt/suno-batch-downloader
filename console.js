@@ -1,42 +1,45 @@
-javascript:(function() {
+javascript: (function () {
   try {
-    const songRows = document.querySelectorAll('[data-testid="song-row"]');
+    // Find all song links using the new URL pattern /song/{UUID}
+    const songLinks = document.querySelectorAll('a[href^="/song/"]');
 
-    if (!songRows.length) {
-      throw new Error("No song rows found.");
+    if (!songLinks.length) {
+      throw new Error("No song links found.");
     }
 
     const downloadLinks = [];
-    const titleCounts = {}; // Keep track of how many times each title appears.
-    const seenIds = new Set(); // Track clip IDs to avoid duplicates.
+    const titleCounts = {};
+    const seenIds = new Set();
 
-    songRows.forEach(row => {
-      const clipId = row.getAttribute('data-clip-id');
-      const titleElement = row.querySelector('.font-sans.text-base.font-medium.line-clamp-1.break-all.text-foreground-primary');
+    songLinks.forEach(link => {
+      // Extract UUID from href="/song/{UUID}"
+      const href = link.getAttribute('href');
+      const match = href.match(/\/song\/([a-f0-9-]{36})/);
+      if (!match) return;
 
-      if (clipId && titleElement) {
-        // Skip duplicate clip IDs
-        if (seenIds.has(clipId)) {
-          return;
-        }
-        seenIds.add(clipId);
-        let songTitle = titleElement.textContent.trim();
-        songTitle = songTitle.replace(/[\\/:*?"<>|]/g, '');
+      const clipId = match[1];
 
-        // Check if the title has been used before.
-        if (titleCounts[songTitle]) {
-          titleCounts[songTitle]++;
-          songTitle += `_${String(titleCounts[songTitle] - 1).padStart(2, '0')}`; // Add _01, _02, etc.
-        } else {
-          titleCounts[songTitle] = 1; // Initialize the count for this title.
-        }
+      // Skip duplicates
+      if (seenIds.has(clipId)) return;
+      seenIds.add(clipId);
 
-        const mp3Url = `https://cdn1.suno.ai/${clipId}.mp3`;
+      // Get title from link text
+      let songTitle = link.textContent.trim();
+      if (!songTitle) return;
 
-        downloadLinks.push(`${songTitle}.mp3|${mp3Url}`);
+      // Sanitize filename
+      songTitle = songTitle.replace(/[\\/:*?"<>|]/g, '');
+
+      // Handle duplicate titles
+      if (titleCounts[songTitle]) {
+        titleCounts[songTitle]++;
+        songTitle += `_${String(titleCounts[songTitle] - 1).padStart(2, '0')}`;
       } else {
-        console.warn("Song row found without a clip ID or title element:", row);
+        titleCounts[songTitle] = 1;
       }
+
+      const mp3Url = `https://cdn1.suno.ai/${clipId}.mp3`;
+      downloadLinks.push(`${songTitle}.mp3|${mp3Url}`);
     });
 
     if (!downloadLinks.length) {
