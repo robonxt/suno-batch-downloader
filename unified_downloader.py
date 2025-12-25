@@ -30,8 +30,10 @@ from collections import deque
 from threading import Lock
 
 import requests
+
 try:
     from mutagen.id3 import ID3, TXXX
+
     MUTAGEN_AVAILABLE = True
 except Exception:
     MUTAGEN_AVAILABLE = False
@@ -55,13 +57,18 @@ from rich.align import Align
 from rich.layout import Layout
 import concurrent.futures
 from rich.layout import Layout
+
 RICH_AVAILABLE = True
-console = Console(theme=Theme({
-    "info": "cyan",
-    "warn": "yellow",
-    "error": "red",
-    "success": "green",
-}))
+console = Console(
+    theme=Theme(
+        {
+            "info": "cyan",
+            "warn": "yellow",
+            "error": "red",
+            "success": "green",
+        }
+    )
+)
 
 CDN_AUDIO = "https://cdn1.suno.ai"
 CDN_IMAGE = "https://cdn2.suno.ai"
@@ -76,6 +83,7 @@ def ensure_dir(p: Path):
 LOG_LINES: deque[Text] = deque(maxlen=400)
 LOG_LOCK = Lock()
 LOG_TEXT = Text()
+
 
 def _panel_print(*args, **kwargs):
     raw = " ".join(str(a) for a in args)
@@ -99,7 +107,16 @@ def _panel_print(*args, **kwargs):
     style = None
     if any(w in low for w in ["error", "failed", "exception", "timeout"]):
         style = "bold red"
-    elif any(w in low for w in ["saved", "tagging complete", "metadata updated", "url ready", "probe ok"]):
+    elif any(
+        w in low
+        for w in [
+            "saved",
+            "tagging complete",
+            "metadata updated",
+            "url ready",
+            "probe ok",
+        ]
+    ):
         style = "bold green"
     elif any(w in low for w in ["skipping", "not available", "returned", "could not"]):
         style = "yellow"
@@ -120,6 +137,7 @@ def _panel_print(*args, **kwargs):
             LOG_TEXT.append_text(t)
             first = False
 
+
 # Route all prints to the logs panel buffer
 print = _panel_print  # type: ignore
 
@@ -137,8 +155,14 @@ def run_ffmpeg(cmd: list[str]) -> bool:
         return False
 
 
-
-def download_with_retries(url: str, dest: Path, attempts: int = 3, wait_seconds: int = 5, prefix: str = "", label: str = "DOWNLOAD") -> bool:
+def download_with_retries(
+    url: str,
+    dest: Path,
+    attempts: int = 3,
+    wait_seconds: int = 5,
+    prefix: str = "",
+    label: str = "DOWNLOAD",
+) -> bool:
     """Attempt download multiple times with wait between attempts."""
     for i in range(1, max(1, attempts) + 1):
         ok = download(url, dest)
@@ -146,14 +170,19 @@ def download_with_retries(url: str, dest: Path, attempts: int = 3, wait_seconds:
             return True
         if i < attempts:
             msg_prefix = f"{prefix} " if prefix else ""
-            print(f"{msg_prefix}{label} failed (attempt {i}/{attempts}). Retrying in {wait_seconds}s...")
+            print(
+                f"{msg_prefix}{label} failed (attempt {i}/{attempts}). Retrying in {wait_seconds}s..."
+            )
             try:
                 time.sleep(wait_seconds)
             except Exception:
                 pass
     return False
 
-def probe_and_download(url: str, dest: Path, timeout: int = 15, prefix: str = "") -> bool:
+
+def probe_and_download(
+    url: str, dest: Path, timeout: int = 15, prefix: str = ""
+) -> bool:
     """Probe a URL with HEAD; if 200, download to dest with retries. Returns True if saved."""
     try:
         pr = requests.head(url, timeout=timeout, allow_redirects=True)
@@ -175,14 +204,16 @@ def probe_and_download(url: str, dest: Path, timeout: int = 15, prefix: str = ""
     return False
 
 
-def acquire_asset(uuid: str,
-                  dest: Path,
-                  primary_url: str,
-                  headers: Dict[str, str],
-                  args,
-                  trigger_fn=None,
-                  label: str = "ASSET",
-                  prefix: str = "") -> bool:
+def acquire_asset(
+    uuid: str,
+    dest: Path,
+    primary_url: str,
+    headers: Dict[str, str],
+    args,
+    trigger_fn=None,
+    label: str = "ASSET",
+    prefix: str = "",
+) -> bool:
     """Common flow: probe CDN -> optionally trigger generation -> final direct download.
     Returns True if dest exists at end.
     """
@@ -192,7 +223,7 @@ def acquire_asset(uuid: str,
         if probe_and_download(primary_url, dest, prefix=prefix):
             print(f"{prefix} Saved {label}: {dest.name}")
     # 2) Trigger generation (if requested and supported)
-    if not dest.exists() and headers and getattr(args, 'wait', False) and trigger_fn:
+    if not dest.exists() and headers and getattr(args, "wait", False) and trigger_fn:
         ok_gen = trigger_fn(
             uuid,
             dest,
@@ -200,20 +231,25 @@ def acquire_asset(uuid: str,
             args.poll_interval,
             args.poll_timeout,
             prefix=prefix,
-            retries=getattr(args, 'retries', 3),
-            retry_wait=getattr(args, 'retry_wait', 5),
+            retries=getattr(args, "retries", 3),
+            retry_wait=getattr(args, "retry_wait", 5),
         )
         if ok_gen:
             print(f"{prefix} Saved {label}: {dest.name}")
     # 3) Final attempt: direct download in case it appeared in the meantime
     if not dest.exists():
-        if download_with_retries(primary_url, dest, attempts=getattr(args, 'retries', 3), wait_seconds=getattr(args, 'retry_wait', 5), prefix=prefix, label=label):
+        if download_with_retries(
+            primary_url,
+            dest,
+            attempts=getattr(args, "retries", 3),
+            wait_seconds=getattr(args, "retry_wait", 5),
+            prefix=prefix,
+            label=label,
+        ):
             print(f"{prefix} Saved {label}: {dest.name}")
         else:
             print(f"{prefix} {label} download failed after retries")
     return dest.exists()
-
-
 
 
 def embed_mp3_uuid_txxx(mp3_path: Path, uuid: str) -> bool:
@@ -259,11 +295,11 @@ def existing_uuid_in_mp3(mp3_path: Path) -> Optional[str]:
     if MUTAGEN_AVAILABLE:
         try:
             tags = ID3(str(mp3_path))
-            for frame in tags.getall('TXXX'):
-                if getattr(frame, 'desc', '').upper() == 'SUNO_UUID' and frame.text:
+            for frame in tags.getall("TXXX"):
+                if getattr(frame, "desc", "").upper() == "SUNO_UUID" and frame.text:
                     return str(frame.text[0])
-            com = tags.get('COMM::eng') or tags.get('COMM')
-            if com and hasattr(com, 'text') and com.text:
+            com = tags.get("COMM::eng") or tags.get("COMM")
+            if com and hasattr(com, "text") and com.text:
                 m = re.search(r"uuid=([0-9a-f\-]{36})", com.text[0], re.I)
                 if m:
                     return m.group(1)
@@ -274,7 +310,7 @@ def existing_uuid_in_mp3(mp3_path: Path) -> Optional[str]:
 
 
 def any_file_with_uuid(out_dir: Path, uuid: str) -> bool:
-    """Lightweight duplicate detection: scan MP3s for embedded UUID. """
+    """Lightweight duplicate detection: scan MP3s for embedded UUID."""
     for p in out_dir.glob("*.mp3"):
         found = existing_uuid_in_mp3(p)
         if found and found.lower() == uuid.lower():
@@ -297,115 +333,106 @@ def download(url: str, dest: Path) -> bool:
         return False
 
 
-
-
-
-
-
-
-def fetch_details_oembed(song_uuid: str) -> Optional[Dict]:
-    # Official oEmbed advertised on page metadata
-    url = f"{STUDIO_BASE}/api/oembed?url=https://suno.com/song/{song_uuid}"
+def fetch_details_clip_api(song_uuid: str) -> Optional[Dict]:
+    """Primary: Fetch clip details from Suno's clip API.
+    Returns full metadata including tags (styles) and prompt (lyrics).
+    """
+    url = f"{STUDIO_BASE}/api/clip/{song_uuid}"
     try:
         r = requests.get(url, timeout=20)
         if r.status_code != 200:
             return None
-        return r.json()
+        clip = r.json()
+        meta = clip.get("metadata", {})
+        display_name = clip.get("display_name", "")
+        handle = clip.get("handle", "")
+        author = f"{display_name} (@{handle})" if handle else display_name
+
+        data = {
+            "title": clip.get("title"),
+            "author_name": author,
+            "thumbnail_url": clip.get("image_large_url") or clip.get("image_url"),
+            "audio_url": clip.get("audio_url"),
+            "page_url": f"https://suno.com/song/{song_uuid}",
+            "styles": meta.get("tags"),
+            "lyrics": meta.get("prompt") or None,  # Empty string -> None
+            "duration": meta.get("duration"),
+            "model_version": clip.get("major_model_version"),
+            "is_instrumental": meta.get("make_instrumental", False),
+        }
+        return {"source": "clip_api", "data": data, "clip": clip}
     except Exception:
         return None
 
 
 def fetch_details_metatags(song_uuid: str) -> Optional[Dict]:
-    """Parse OpenGraph/Twitter meta tags from the public song page.
-    Returns a dict shaped similarly to oEmbed: {source: 'metatags', data: {...}}.
-    """
+    """Fallback: Parse OpenGraph meta tags for basic info (no lyrics/styles)."""
     try:
         html = requests.get(f"https://suno.com/song/{song_uuid}", timeout=20).text
-        # Simple helpers
-        def _meta_prop(prop: str) -> Optional[str]:
-            m = re.search(rf'<meta[^>]+property=["\']{re.escape(prop)}["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-            return m.group(1) if m else None
-        def _meta_name(name: str) -> Optional[str]:
-            m = re.search(rf'<meta[^>]+name=["\']{re.escape(name)}["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-            return m.group(1) if m else None
-        def _title_tag() -> Optional[str]:
-            m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
-            return m.group(1).strip() if m else None
 
-        title = _meta_prop("og:title") or _meta_name("twitter:title") or _title_tag()
-        desc = _meta_prop("og:description") or _meta_name("twitter:description")
-        image = _meta_prop("og:image") or _meta_name("twitter:image")
-        audio = _meta_prop("og:audio") or _meta_name("twitter:player:stream")
-
-        # Try to infer author from the <title> form: "<song> by <author> | Suno"
-        author_name = None
-        t = _title_tag()
-        if t and " by " in t:
-            try:
-                author_name = t.split(" by ", 1)[1].split("|")[0].strip()
-            except Exception:
-                author_name = None
-
-        data = {
-            "title": title,
-            "author_name": author_name,
-            "thumbnail_url": image,
-            "description": desc,
-            "audio_url": audio,
-            "page_url": f"https://suno.com/song/{song_uuid}",
-        }
-        # Only accept if we got at least a title or image
-        if any([title, image, audio, author_name]):
-            return {"source": "metatags", "data": data}
-        return None
-    except Exception:
-        return None
-
-
-def fetch_details_page(song_uuid: str) -> Optional[Dict]:
-    # Fallback: parse the NextJS hydration JSON for `clip`
-    try:
-        html = requests.get(f"https://suno.com/song/{song_uuid}", timeout=20).text
-        # Find a snippet containing '"clip":{'...}
-        m = re.search(r'\"clip\":\{.*?\}\},\"persona\":', html, re.DOTALL)
-        if not m:
+        def _meta(attr: str, val: str) -> Optional[str]:
+            patterns = [
+                rf'<meta[^>]*{attr}\s*=\s*["\']?{re.escape(val)}["\']?[^>]*content\s*=\s*["\']([^"\']+)["\']',
+                rf'<meta[^>]*content\s*=\s*["\']([^"\']+)["\'][^>]*{attr}\s*=\s*["\']?{re.escape(val)}["\']?',
+            ]
+            for p in patterns:
+                m = re.search(p, html, re.IGNORECASE | re.DOTALL)
+                if m:
+                    return m.group(1)
             return None
-        # Extract JSON substring and try to balance braces (approx)
-        blob = m.group(0)
-        # Clean trailing ,"persona":
-        blob = re.sub(r',\\"persona\\":$', '', blob)
-        # Wrap into an object so we can parse
-        jtext = '{' + blob + '}'
-        # Unescape quotes
-        jtext = jtext.encode('utf-8').decode('unicode_escape')
-        data = json.loads(jtext)
-        return data
+
+        title = _meta("property", "og:title")
+        image = _meta("property", "og:image")
+        audio = _meta("property", "og:audio")
+        desc = _meta("name", "description") or ""
+
+        # Extract author from description: "Title by Author (@handle). Listen..."
+        author = None
+        if " by " in desc:
+            try:
+                after_by = desc.split(" by ", 1)[1]
+                author = re.split(r"\.\s*(?:Listen|$)", after_by, 1)[0].strip()
+            except Exception:
+                pass
+
+        if not any([title, image, audio]):
+            return None
+
+        return {
+            "source": "metatags",
+            "data": {
+                "title": title,
+                "author_name": author,
+                "thumbnail_url": image,
+                "audio_url": audio,
+                "page_url": f"https://suno.com/song/{song_uuid}",
+                "styles": None,
+                "lyrics": None,
+            },
+        }
     except Exception:
         return None
 
 
 def collect_song_fields(song_uuid: str, details_dir: Optional[Path]) -> Dict:
-    # If details JSON provided by user, prefer it
+    """Collect song metadata. Priority: local JSON > clip API > metatags fallback."""
+    # 1. User-provided JSON file
     if details_dir:
         for name in (f"{song_uuid}.json", f"{song_uuid}_details.json"):
             p = details_dir / name
             if p.exists():
                 try:
-                    return json.loads(p.read_text(encoding='utf-8'))
+                    return json.loads(p.read_text(encoding="utf-8"))
                 except Exception:
                     pass
-    # Try oEmbed (disabled)
-    # data = fetch_details_oembed(song_uuid)
-    # if isinstance(data, dict) and data:
-    #     return {"source": "oembed", "data": data}
-    # Try OpenGraph/Twitter meta tags as safer public fallback
-    data_meta = fetch_details_metatags(song_uuid)
-    if isinstance(data_meta, dict) and data_meta:
-        return data_meta
-    # Fallback parse of page (disabled)
-    # data2 = fetch_details_page(song_uuid)
-    # if isinstance(data2, dict) and data2:
-    #     return {"source": "page", "data": data2}
+    # 2. Suno clip API (full metadata with lyrics/styles)
+    data = fetch_details_clip_api(song_uuid)
+    if data:
+        return data
+    # 3. Fallback: OpenGraph meta tags (basic info only)
+    data = fetch_details_metatags(song_uuid)
+    if data:
+        return data
     return {}
 
 
@@ -413,20 +440,50 @@ def build_cover_url(song_uuid: str) -> str:
     return f"{CDN_IMAGE}/image_large_{song_uuid}.jpeg"
 
 
-def embed_mp3(ffmpeg_path: str, mp3_path: Path, cover_path: Optional[Path], title: str, artist: str, comment: str) -> bool:
+def embed_mp3(
+    ffmpeg_path: str,
+    mp3_path: Path,
+    cover_path: Optional[Path],
+    title: str,
+    artist: str,
+    comment: str,
+    lyrics: Optional[str] = None,
+) -> bool:
     temp = mp3_path.with_name(f"temp_{mp3_path.name}")
     cmd = [ffmpeg_path, "-i", str(mp3_path)]
     if cover_path and cover_path.exists():
-        cmd += ["-i", str(cover_path), "-map", "0", "-map", "1", "-c:v", "copy", "-disposition:v", "attached_pic",
-                "-metadata:s:v", "title=Album cover", "-metadata:s:v", "comment=Cover (front)"]
+        cmd += [
+            "-i",
+            str(cover_path),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c:v",
+            "copy",
+            "-disposition:v",
+            "attached_pic",
+            "-metadata:s:v",
+            "title=Album cover",
+            "-metadata:s:v",
+            "comment=Cover (front)",
+        ]
     cmd += [
-        "-c", "copy",
-        "-metadata", f"title={title}",
-        "-metadata", f"artist={artist}",
-        "-metadata", f"album=Suno",
-        "-metadata", f"comment={comment[:300]}",
-        "-y", str(temp),
+        "-c",
+        "copy",
+        "-metadata",
+        f"title={title}",
+        "-metadata",
+        f"artist={artist}",
+        "-metadata",
+        f"album=Suno",
+        "-metadata",
+        f"comment={comment[:300]}",
     ]
+    # Add lyrics if available (ffmpeg writes to USLT frame for ID3)
+    if lyrics:
+        cmd += ["-metadata", f"lyrics={lyrics}"]
+    cmd += ["-y", str(temp)]
     ok = run_ffmpeg(cmd)
     if not ok:
         if temp.exists():
@@ -439,7 +496,16 @@ def embed_mp3(ffmpeg_path: str, mp3_path: Path, cover_path: Optional[Path], titl
         return False
 
 
-def trigger_wav_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], poll_interval: int, poll_timeout: int, prefix: str = "", retries: int = 3, retry_wait: int = 5) -> bool:
+def trigger_wav_and_wait(
+    uuid: str,
+    out_path: Path,
+    headers: Dict[str, str],
+    poll_interval: int,
+    poll_timeout: int,
+    prefix: str = "",
+    retries: int = 3,
+    retry_wait: int = 5,
+) -> bool:
     endpoint = f"{STUDIO_BASE}/api/gen/{uuid}/convert_wav/"
     try:
         r = requests.post(endpoint, headers=headers, timeout=60)
@@ -463,17 +529,24 @@ def trigger_wav_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], pol
                 try:
                     body = r2.json()
                     dl_url = (
-                        body.get('audioWavUrl')
-                        or body.get('data', {}).get('audioWavUrl')
-                        or body.get('download_url')
-                        or body.get('data', {}).get('download_url')
+                        body.get("audioWavUrl")
+                        or body.get("data", {}).get("audioWavUrl")
+                        or body.get("download_url")
+                        or body.get("data", {}).get("download_url")
                     )
                 except Exception:
                     dl_url = None
                 if dl_url:
                     if prefix:
                         print(f"{prefix} URL ready -> download")
-                    return download_with_retries(dl_url, out_path, attempts=retries, wait_seconds=retry_wait, prefix=prefix, label="WAV")
+                    return download_with_retries(
+                        dl_url,
+                        out_path,
+                        attempts=retries,
+                        wait_seconds=retry_wait,
+                        prefix=prefix,
+                        label="WAV",
+                    )
         except requests.RequestException:
             pass
         # Probe fixed CDN URL without exposing options in CLI
@@ -483,7 +556,14 @@ def trigger_wav_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], pol
             if pr.status_code == 200:
                 if prefix:
                     print(f"{prefix} Probe OK -> download")
-                return download_with_retries(probe_url, out_path, attempts=retries, wait_seconds=retry_wait, prefix=prefix, label="WAV")
+                return download_with_retries(
+                    probe_url,
+                    out_path,
+                    attempts=retries,
+                    wait_seconds=retry_wait,
+                    prefix=prefix,
+                    label="WAV",
+                )
         except requests.RequestException:
             pass
         attempt += 1
@@ -492,7 +572,16 @@ def trigger_wav_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], pol
     return False
 
 
-def trigger_mp4_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], poll_interval: int, poll_timeout: int, prefix: str = "", retries: int = 3, retry_wait: int = 5) -> bool:
+def trigger_mp4_and_wait(
+    uuid: str,
+    out_path: Path,
+    headers: Dict[str, str],
+    poll_interval: int,
+    poll_timeout: int,
+    prefix: str = "",
+    retries: int = 3,
+    retry_wait: int = 5,
+) -> bool:
     endpoint = f"{STUDIO_BASE}/api/video/generate/{uuid}/"
     try:
         r = requests.post(endpoint, headers=headers, timeout=60)
@@ -517,7 +606,14 @@ def trigger_mp4_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], pol
             if pr.status_code == 200:
                 if prefix:
                     print(f"{prefix} Probe OK -> download")
-                return download_with_retries(probe_url, out_path, attempts=retries, wait_seconds=retry_wait, prefix=prefix, label="MP4")
+                return download_with_retries(
+                    probe_url,
+                    out_path,
+                    attempts=retries,
+                    wait_seconds=retry_wait,
+                    prefix=prefix,
+                    label="MP4",
+                )
         except requests.RequestException:
             pass
     if prefix:
@@ -525,31 +621,43 @@ def trigger_mp4_and_wait(uuid: str, out_path: Path, headers: Dict[str, str], pol
     return False
 
 
-def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
-                args, out_dir: Path, details_dir: Optional[Path], headers: Dict[str, str],
-                want_mp3: bool, want_mp4: bool, want_wav: bool,
-                progress: Progress, task_id) -> Dict[str, bool]:
+def process_one(
+    uuid: str,
+    left: str,
+    url: str,
+    idx: int,
+    total_unique: int,
+    args,
+    out_dir: Path,
+    details_dir: Optional[Path],
+    headers: Dict[str, str],
+    want_mp3: bool,
+    want_mp4: bool,
+    want_wav: bool,
+    progress: Progress,
+    task_id,
+) -> Dict[str, bool]:
     # Decide filename according to --name-mode
     # Determine extension from url
-    ext = os.path.splitext(url.split('?')[0])[-1].lower() or '.mp3'
+    ext = os.path.splitext(url.split("?")[0])[-1].lower() or ".mp3"
     # Gather details for potential title
     details = collect_song_fields(uuid, details_dir)
     title_from_details = None
     if details:
-        data = details.get('data', details)
-        clip = data.get('clip') if isinstance(data, dict) else None
+        data = details.get("data", details)
+        clip = data.get("clip") if isinstance(data, dict) else None
         if clip and isinstance(clip, dict):
-            title_from_details = clip.get('title')
+            title_from_details = clip.get("title")
         else:
-            title_from_details = data.get('title')
+            title_from_details = data.get("title")
 
-    if args.name_mode == 'input' and left:
+    if args.name_mode == "input" and left:
         filename = left
         if not filename.lower().endswith(ext):
             filename += ext
-    elif args.name_mode == 'details' and title_from_details:
+    elif args.name_mode == "details" and title_from_details:
         filename = f"{title_from_details}{ext}"
-    elif args.name_mode == 'uuid' or not left:
+    elif args.name_mode == "uuid" or not left:
         filename = f"{uuid}{ext}"
     else:
         filename = (left or uuid) + ext
@@ -568,26 +676,26 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
         details = collect_song_fields(uuid, details_dir)
     # Normalize fields for tagging
     title = stem
-    artist = ''
+    artist = ""
     cover_url = build_cover_url(uuid)
     comment_parts = []
 
     if details:
-        src = details.get('source')
-        data = details.get('data', {}) if 'data' in details else details
+        src = details.get("source")
+        data = details.get("data", {}) if "data" in details else details
         # Page clip path
-        clip = data.get('clip') if 'clip' in data else None
+        clip = data.get("clip") if "clip" in data else None
         if clip:
-            title = clip.get('title') or title
+            title = clip.get("title") or title
             artist = f"{clip.get('display_name','')} (@{clip.get('handle','')})".strip()
             # Always prefer the large image; NEVER use smaller thumbnail/image fields
-            cover_url = clip.get('image_large_url') or build_cover_url(uuid)
-            md = clip.get('metadata', {})
-            prompt = md.get('prompt')
-            tags_long = md.get('tags')
-            display_tags = clip.get('display_tags')
+            cover_url = clip.get("image_large_url") or build_cover_url(uuid)
+            md = clip.get("metadata", {})
+            prompt = md.get("prompt")
+            tags_long = md.get("tags")
+            display_tags = clip.get("display_tags")
             model = f"{clip.get('major_model_version','')} {clip.get('model_name','')}".strip()
-            dur = md.get('duration')
+            dur = md.get("duration")
             if prompt:
                 comment_parts.append(f"prompt: {prompt}")
             if display_tags:
@@ -599,18 +707,30 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
             if dur:
                 comment_parts.append(f"duration: {dur}s")
         else:
-            # oEmbed may have title/author_name/thumbnail_url
-            title = data.get('title') or title
-            artist = data.get('author_name') or artist
+            # Metatags data: title/author_name/thumbnail_url/styles/lyrics
+            title = data.get("title") or title
+            artist = data.get("author_name") or artist
+            # Add styles to comment if available
+            styles = data.get("styles")
+            if styles:
+                comment_parts.append(f"styles: {styles}")
+            # Store lyrics for later use (can be used in JSON sidecar)
+            # Note: lyrics are too long for MP3 comment, stored in JSON instead
             # Do NOT use oEmbed thumbnails for cover art; keep using large image URL
 
+    # Build lyrics field for JSON (not for MP3 comment - too long)
+    lyrics = None
+    if details:
+        data = details.get("data", {}) if "data" in details else details
+        lyrics = data.get("lyrics")
+
     # Prepend UUID to comment for broad containers
-    base_comment = ' | '.join([p for p in comment_parts if p])
+    base_comment = " | ".join([p for p in comment_parts if p])
     comment = f"uuid={uuid}" + (f" | {base_comment}" if base_comment else "")
 
     # Prepare canonical URLs for formats based on UUID
-    url_is_mp3 = url.lower().endswith('.mp3')
-    url_is_mp4 = url.lower().endswith('.mp4')
+    url_is_mp3 = url.lower().endswith(".mp3")
+    url_is_mp4 = url.lower().endswith(".mp4")
     mp3_url = url if url_is_mp3 else f"{CDN_AUDIO}/{uuid}.mp3"
     mp4_url = url if url_is_mp4 else f"{CDN_AUDIO}/{uuid}.mp4"
 
@@ -662,7 +782,15 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
             # Always fetch the preferred large image to avoid cached small thumbnails
             download(cover_url, cover_path)
             print(f"[#{idx} MP3] Embedding metadata and cover...")
-            if embed_mp3(args.ffmpeg_path, mp3_dest, cover_path if cover_path.exists() else None, title, artist or 'Suno', comment):
+            if embed_mp3(
+                args.ffmpeg_path,
+                mp3_dest,
+                cover_path if cover_path.exists() else None,
+                title,
+                artist or "Suno",
+                comment,
+                lyrics,
+            ):
                 print(f"[#{idx} MP3] Tagging complete")
             else:
                 print(f"[#{idx} MP3] Tagging failed")
@@ -671,7 +799,9 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
             if embed_mp3_uuid_txxx(mp3_dest, uuid):
                 print(f"[#{idx} MP3] Embedded UUID (TXXX:SUNO_UUID)")
             else:
-                print(f"[#{idx} MP3] Could not embed UUID TXXX; comment still contains uuid=")
+                print(
+                    f"[#{idx} MP3] Could not embed UUID TXXX; comment still contains uuid="
+                )
             progress.advance(task_id, 1)
 
     # MP4
@@ -699,7 +829,9 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
                 prefix=f"[#{idx} MP4]",
             )
             if not got_mp4 and not (headers and args.wait):
-                print(f"[#{idx} MP4] Not available on CDN; no auth/wait provided to trigger generation")
+                print(
+                    f"[#{idx} MP4] Not available on CDN; no auth/wait provided to trigger generation"
+                )
             mp4_just_saved = bool(got_mp4)
             result["mp4_saved"] = mp4_just_saved
             if not got_mp4:
@@ -708,7 +840,11 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
         # Only update metadata when newly saved
         if mp4_just_saved and not args.no_embed_uuid:
             print(f"[#{idx} MP4] Updating metadata...")
-            if embed_simple_metadata(args.ffmpeg_path, mp4_dest, {"title": title, "artist": artist or 'Suno', "comment": comment}):
+            if embed_simple_metadata(
+                args.ffmpeg_path,
+                mp4_dest,
+                {"title": title, "artist": artist or "Suno", "comment": comment},
+            ):
                 print(f"[#{idx} MP4] Metadata updated with UUID")
             else:
                 print(f"[#{idx} MP4] Metadata update failed")
@@ -740,7 +876,9 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
                 prefix=f"[#{idx} WAV]",
             )
             if not got_wav and not (headers and args.wait):
-                print(f"[#{idx} WAV] Not available on CDN; no auth/wait provided to trigger generation")
+                print(
+                    f"[#{idx} WAV] Not available on CDN; no auth/wait provided to trigger generation"
+                )
             wav_just_saved = bool(got_wav)
             result["wav_saved"] = wav_just_saved
             if not got_wav:
@@ -749,7 +887,11 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
         # Only update metadata when newly saved
         if wav_just_saved and not args.no_embed_uuid:
             print(f"[#{idx} WAV] Updating metadata...")
-            if embed_simple_metadata(args.ffmpeg_path, wav_dest, {"title": title, "artist": artist or 'Suno', "comment": comment}):
+            if embed_simple_metadata(
+                args.ffmpeg_path,
+                wav_dest,
+                {"title": title, "artist": artist or "Suno", "comment": comment},
+            ):
                 print(f"[#{idx} WAV] Metadata updated with UUID")
             else:
                 print(f"[#{idx} WAV] Metadata update failed")
@@ -758,8 +900,10 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
     # Save details JSON sidecar for traceability
     if details:
         try:
-            (out_dir / 'metadata').mkdir(exist_ok=True)
-            with open(out_dir / 'metadata' / f"{uuid}.json", 'w', encoding='utf-8') as jf:
+            (out_dir / "metadata").mkdir(exist_ok=True)
+            with open(
+                out_dir / "metadata" / f"{uuid}.json", "w", encoding="utf-8"
+            ) as jf:
                 json.dump(details, jf, indent=2, ensure_ascii=False)
         except Exception:
             pass
@@ -768,33 +912,113 @@ def process_one(uuid: str, left: str, url: str, idx: int, total_unique: int,
 
     return result
 
+
 def main():
     parser = argparse.ArgumentParser(description="Unified Suno downloader/embedder")
-    parser.add_argument("--songfile", required=True, help="[required] Input file with lines: FILENAME|URL")
-    parser.add_argument("--formats", default="mp3", help="[optional] Comma list: mp3,mp4,wav (default: mp3)")
-    parser.add_argument("--output-dir", help="[optional] Destination directory (default: {songfile}_files)")
-    parser.add_argument("--wait", action="store_true", help="[optional] When WAV or MP4 requested, wait until downloadable (trigger and poll if needed)")
-    parser.add_argument("--no-metadata", action="store_true", help="[optional] Skip metadata writing (cover/art and tags)")
-    parser.add_argument("--auth", help="[optional] Authorization Bearer token for WAV/MP4 generation")
+    parser.add_argument(
+        "--songfile",
+        required=True,
+        help="[required] Input file with lines: FILENAME|URL",
+    )
+    parser.add_argument(
+        "--formats",
+        default="mp3",
+        help="[optional] Comma list: mp3,mp4,wav (default: mp3)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="[optional] Destination directory (default: {songfile}_files)",
+    )
+    parser.add_argument(
+        "--wait",
+        action="store_true",
+        help="[optional] When WAV or MP4 requested, wait until downloadable (trigger and poll if needed)",
+    )
+    parser.add_argument(
+        "--no-metadata",
+        action="store_true",
+        help="[optional] Skip metadata writing (cover/art and tags)",
+    )
+    parser.add_argument(
+        "--auth", help="[optional] Authorization Bearer token for WAV/MP4 generation"
+    )
 
-    parser.add_argument("--details-dir", help="[optional] Directory with per-uuid JSON details to enrich tags")
+    parser.add_argument(
+        "--details-dir",
+        help="[optional] Directory with per-uuid JSON details to enrich tags",
+    )
 
-    parser.add_argument("--poll-interval", type=int, default=5, help="[optional] Poll interval (seconds) for WAV/MP4 generation (default: 5)")
-    parser.add_argument("--poll-timeout", type=int, default=60, help="[optional] Poll timeout (seconds) for WAV/MP4 generation (default: 60)")
-    parser.add_argument("--retries", type=int, default=3, help="[optional] Number of retry attempts for MP4/WAV downloads (default: 3)")
-    parser.add_argument("--retry-wait", type=int, default=5, help="[optional] Seconds to wait between retries (default: 5)")
+    parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=5,
+        help="[optional] Poll interval (seconds) for WAV/MP4 generation (default: 5)",
+    )
+    parser.add_argument(
+        "--poll-timeout",
+        type=int,
+        default=60,
+        help="[optional] Poll timeout (seconds) for WAV/MP4 generation (default: 60)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=3,
+        help="[optional] Number of retry attempts for MP4/WAV downloads (default: 3)",
+    )
+    parser.add_argument(
+        "--retry-wait",
+        type=int,
+        default=5,
+        help="[optional] Seconds to wait between retries (default: 5)",
+    )
 
-    parser.add_argument("--ffmpeg-path", default="ffmpeg", help="[optional] Path to ffmpeg (used for tagging and metadata)")
-    parser.add_argument("--name-mode", choices=["input", "details", "uuid"], default="input", help="[optional] How to choose base filename when title missing or to override (default: input)")
-    parser.add_argument("--no-embed-uuid", action="store_true", help="[optional] Do not embed UUID into metadata (embeds by default)")
-    parser.add_argument("--logs-height", type=int, default=12, help="[optional] Max height (rows) for the Logs panel (default: 12)")
-    parser.add_argument("--downloads-height", type=int, default=20, help="[optional] Max height (rows) for the Downloads panel (default: 20)")
-    parser.add_argument("--progress-visible", type=int, default=10, help="[optional] Max number of song progress rows to display at once (default: 10)")
+    parser.add_argument(
+        "--ffmpeg-path",
+        default="ffmpeg",
+        help="[optional] Path to ffmpeg (used for tagging and metadata)",
+    )
+    parser.add_argument(
+        "--name-mode",
+        choices=["input", "details", "uuid"],
+        default="input",
+        help="[optional] How to choose base filename when title missing or to override (default: input)",
+    )
+    parser.add_argument(
+        "--no-embed-uuid",
+        action="store_true",
+        help="[optional] Do not embed UUID into metadata (embeds by default)",
+    )
+    parser.add_argument(
+        "--logs-height",
+        type=int,
+        default=12,
+        help="[optional] Max height (rows) for the Logs panel (default: 12)",
+    )
+    parser.add_argument(
+        "--downloads-height",
+        type=int,
+        default=20,
+        help="[optional] Max height (rows) for the Downloads panel (default: 20)",
+    )
+    parser.add_argument(
+        "--progress-visible",
+        type=int,
+        default=10,
+        help="[optional] Max number of song progress rows to display at once (default: 10)",
+    )
 
-    parser.add_argument("--session-id", help="[optional] Studio session-id header for WAV/MP4 generation")
-    parser.add_argument("--browser-token", help="[optional] Studio browser-token header for WAV/MP4 generation")
-    parser.add_argument("--device-id", help="[optional] Studio device-id header for WAV/MP4 generation")
-
+    parser.add_argument(
+        "--session-id",
+        help="[optional] Studio session-id header for WAV/MP4 generation",
+    )
+    parser.add_argument(
+        "--browser-token",
+        help="[optional] Studio browser-token header for WAV/MP4 generation",
+    )
+    parser.add_argument(
+        "--device-id", help="[optional] Studio device-id header for WAV/MP4 generation"
+    )
 
     args = parser.parse_args()
 
@@ -803,15 +1027,17 @@ def main():
         print(f"Error: songfile not found: {in_path}")
         sys.exit(1)
 
-    out_dir = Path(args.output_dir) if args.output_dir else Path(f"{in_path.stem}_files")
+    out_dir = (
+        Path(args.output_dir) if args.output_dir else Path(f"{in_path.stem}_files")
+    )
     ensure_dir(out_dir)
 
     details_dir = Path(args.details_dir) if args.details_dir else None
 
-    want = {s.strip().lower() for s in args.formats.split(',')}
-    want_mp3 = 'mp3' in want
-    want_mp4 = 'mp4' in want
-    want_wav = 'wav' in want
+    want = {s.strip().lower() for s in args.formats.split(",")}
+    want_mp3 = "mp3" in want
+    want_mp4 = "mp4" in want
+    want_wav = "wav" in want
 
     # Prepare auth headers if provided (used for WAV and MP4 triggers)
     headers = {}
@@ -828,14 +1054,14 @@ def main():
     unique_map = {}
     order = []
     total_lines = 0
-    with open(in_path, 'r', encoding='utf-8') as f:
+    with open(in_path, "r", encoding="utf-8") as f:
         for raw in f:
             total_lines += 1
             line = raw.strip()
             if not line:
                 continue
-            if '|' in line:
-                left, url = [s.strip() for s in line.split('|', 1)]
+            if "|" in line:
+                left, url = [s.strip() for s in line.split("|", 1)]
             else:
                 # URL-only mode
                 left, url = "", line.strip()
@@ -850,8 +1076,12 @@ def main():
     # Write temp file with unique cleaned UUIDs (one per line)
     tmp_uuid_path = in_path.with_name(f"{in_path.stem}.unique_uuids.tmp")
     try:
-        tmp_uuid_path.write_text("\n".join(order) + ("\n" if order else ""), encoding='utf-8')
-        print(f"Unique UUID list written: {tmp_uuid_path} ({len(order)} unique of {total_lines} lines)")
+        tmp_uuid_path.write_text(
+            "\n".join(order) + ("\n" if order else ""), encoding="utf-8"
+        )
+        print(
+            f"Unique UUID list written: {tmp_uuid_path} ({len(order)} unique of {total_lines} lines)"
+        )
     except Exception as e:
         print(f"Failed to write unique UUID temp file: {e}")
 
@@ -869,6 +1099,7 @@ def main():
     index_map = {u: i for i, u in enumerate(order, 1)}
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = []
+
         # Per-song progress
         def calc_steps() -> int:
             steps = 0
@@ -929,6 +1160,7 @@ def main():
         )
 
         queue_text = Text()
+
         def refresh_queue_text(pending_list: list[str]):
             queue_text.__init__("\n".join(pending_list))
 
@@ -950,7 +1182,9 @@ def main():
 
         layout["top"].update(build_logs_panel(logs_h_eff))
         layout["active"].update(Panel(progress, title="Active", expand=True))
-        layout["queue"].update(Panel(Align(queue_text, vertical="top"), title="Queue", expand=True))
+        layout["queue"].update(
+            Panel(Align(queue_text, vertical="top"), title="Queue", expand=True)
+        )
 
         with Live(layout, refresh_per_second=8, console=console):
             # Aggregates
@@ -979,6 +1213,7 @@ def main():
 
             def build_stats_panel() -> Panel:
                 t = Text()
+
                 def add_line(label: str, kind: str, mp3v=None, mp4v=None, wavv=None):
                     # Label
                     t.append(label + ": ", style="bold")
@@ -1000,21 +1235,37 @@ def main():
                         first = False
                     t.append("\n")
 
-                add_line("New", "ok",
-                         agg["mp3_saved"] if want_mp3 else None,
-                         agg["mp4_saved"] if want_mp4 else None,
-                         agg["wav_saved"] if want_wav else None)
-                add_line("Fail", "fail",
-                         agg["mp3_failed"] if want_mp3 else None,
-                         agg["mp4_failed"] if want_mp4 else None,
-                         agg["wav_failed"] if want_wav else None)
-                add_line("Skip exist", "skip",
-                         agg["mp3_skipped_existing"] if want_mp3 else None,
-                         agg["mp4_skipped_existing"] if want_mp4 else None,
-                         agg["wav_skipped_existing"] if want_wav else None)
+                add_line(
+                    "New",
+                    "ok",
+                    agg["mp3_saved"] if want_mp3 else None,
+                    agg["mp4_saved"] if want_mp4 else None,
+                    agg["wav_saved"] if want_wav else None,
+                )
+                add_line(
+                    "Fail",
+                    "fail",
+                    agg["mp3_failed"] if want_mp3 else None,
+                    agg["mp4_failed"] if want_mp4 else None,
+                    agg["wav_failed"] if want_wav else None,
+                )
+                add_line(
+                    "Skip exist",
+                    "skip",
+                    agg["mp3_skipped_existing"] if want_mp3 else None,
+                    agg["mp4_skipped_existing"] if want_mp4 else None,
+                    agg["wav_skipped_existing"] if want_wav else None,
+                )
                 if want_mp3:
-                    add_line("Skip dup UUID", "skip", agg["mp3_skipped_uuid"], None, None)
-                return Panel(Align(t, vertical="top"), title="Stats", title_align="left", expand=True)
+                    add_line(
+                        "Skip dup UUID", "skip", agg["mp3_skipped_uuid"], None, None
+                    )
+                return Panel(
+                    Align(t, vertical="top"),
+                    title="Stats",
+                    title_align="left",
+                    expand=True,
+                )
 
             # Submit up to max_workers; keep the rest in a pending queue displayed at right
             pending = deque(order)
@@ -1023,16 +1274,30 @@ def main():
             def submit_next(slots: int = 1):
                 nonlocal pending
                 count = 0
-                while pending and count < slots and len(running) < executor._max_workers:
+                while (
+                    pending and count < slots and len(running) < executor._max_workers
+                ):
                     u = pending.popleft()
                     left, url = unique_map[u]
                     steps = calc_steps()
                     desc = f"#{index_map[u]} ({u})"
                     task_id = progress.add_task("song", total=steps, desc=desc)
                     fut = executor.submit(
-                        process_one, u, left, url, index_map[u], total_unique,
-                        args, out_dir, details_dir, headers, want_mp3, want_mp4, want_wav,
-                        progress, task_id
+                        process_one,
+                        u,
+                        left,
+                        url,
+                        index_map[u],
+                        total_unique,
+                        args,
+                        out_dir,
+                        details_dir,
+                        headers,
+                        want_mp3,
+                        want_mp4,
+                        want_wav,
+                        progress,
+                        task_id,
                     )
                     running[fut] = task_id
                     count += 1
@@ -1045,7 +1310,11 @@ def main():
 
             # Drive the event loop while there are running tasks
             while running:
-                done, _ = concurrent.futures.wait(list(running.keys()), timeout=0.25, return_when=concurrent.futures.FIRST_COMPLETED)
+                done, _ = concurrent.futures.wait(
+                    list(running.keys()),
+                    timeout=0.25,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
                 # Refresh logs panel to keep view pinned to latest entries
                 layout["top"].update(build_logs_panel(logs_h_eff))
                 for fut in done:
@@ -1094,7 +1363,12 @@ def main():
             return f"[yellow]{n}[/]" if n > 0 else f"[dim]{n}[/]"
         return str(n)
 
-    tbl = Table(title="Run Summary", show_edge=True, header_style="bold", title_style="bold cyan")
+    tbl = Table(
+        title="Run Summary",
+        show_edge=True,
+        header_style="bold",
+        title_style="bold cyan",
+    )
     tbl.add_column("Metric", justify="left", style="bold")
     if want_mp3:
         tbl.add_column("MP3", justify="right")
@@ -1104,7 +1378,13 @@ def main():
         tbl.add_column("WAV", justify="right")
 
     # Utility to add a row with only selected formats
-    def add_row(metric: str, mp3v: Optional[int] = None, mp4v: Optional[int] = None, wavv: Optional[int] = None, kind: str = "ok"):
+    def add_row(
+        metric: str,
+        mp3v: Optional[int] = None,
+        mp4v: Optional[int] = None,
+        wavv: Optional[int] = None,
+        kind: str = "ok",
+    ):
         row = [metric]
         if want_mp3:
             row.append(style_count(mp3v or 0, kind) if mp3v is not None else "")
@@ -1114,14 +1394,40 @@ def main():
             row.append(style_count(wavv or 0, kind) if wavv is not None else "")
         tbl.add_row(*row)
 
-    console.print(Panel(f"Duration: [bold]{mins}m {secs}s[/] ([dim]{elapsed:.1f}s[/])\nSongs processed: [bold]{total_songs}[/]", title="Run Info", expand=False))
+    console.print(
+        Panel(
+            f"Duration: [bold]{mins}m {secs}s[/] ([dim]{elapsed:.1f}s[/])\nSongs processed: [bold]{total_songs}[/]",
+            title="Run Info",
+            expand=False,
+        )
+    )
 
-    add_row("Newly saved", mp3_ok if want_mp3 else None, mp4_ok if want_mp4 else None, wav_ok if want_wav else None, kind="ok")
-    add_row("Failed (this run)", mp3_fail if want_mp3 else None, mp4_fail if want_mp4 else None, wav_fail if want_wav else None, kind="fail")
-    add_row("Skipped: existing file", mp3_skip_exist if want_mp3 else None, mp4_skip_exist if want_mp4 else None, wav_skip_exist if want_wav else None, kind="skip")
+    add_row(
+        "Newly saved",
+        mp3_ok if want_mp3 else None,
+        mp4_ok if want_mp4 else None,
+        wav_ok if want_wav else None,
+        kind="ok",
+    )
+    add_row(
+        "Failed (this run)",
+        mp3_fail if want_mp3 else None,
+        mp4_fail if want_mp4 else None,
+        wav_fail if want_wav else None,
+        kind="fail",
+    )
+    add_row(
+        "Skipped: existing file",
+        mp3_skip_exist if want_mp3 else None,
+        mp4_skip_exist if want_mp4 else None,
+        wav_skip_exist if want_wav else None,
+        kind="skip",
+    )
     # MP3-only extra skip reason
     if want_mp3:
-        add_row("Skipped: duplicate UUID in library", mp3_skip_uuid, None, None, kind="skip")
+        add_row(
+            "Skipped: duplicate UUID in library", mp3_skip_uuid, None, None, kind="skip"
+        )
 
     console.print(tbl)
 
