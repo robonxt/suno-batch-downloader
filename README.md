@@ -8,15 +8,16 @@ Batch recovery tool for songs from Suno with embedded metadata (title, artist, c
 
 ## Install
 ```bash
-pip install requests mutagen rich
+pip install requests mutagen rich cryptography
 ```
+*(Note: `cryptography` provides hardware-accelerated AES decryption for large batches. If omitted, pure-Python fallback is used automatically).*
 
 ## Usage
 
 Use `suno_batch_recovery.py`.
 
 ### 1. Browser Web UI Mode
-Launch the local web dashboard:
+Launch via double-clicking `start_web_ui.bat` or run:
 ```bash
 python suno_batch_recovery.py --web
 ```
@@ -38,6 +39,8 @@ Options:
 --workers        Concurrent workers (default: 5)
 --ffmpeg         Path to ffmpeg executable (if not in PATH)
 --web            Launch local Web UI on http://localhost:8080
+--no-tui         Disable Rich terminal UI and use plain text output
+--logs-height    Height of terminal logs panel in lines (default: 10)
 ```
 
 ## Legacy Downloader

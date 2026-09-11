@@ -52,11 +52,104 @@ try:
 except ImportError:
     MUTAGEN_ID3_AVAILABLE = False
 
+from collections import deque
+from threading import Lock
+
 try:
     from mutagen.mp4 import MP4, MP4Cover
     MUTAGEN_MP4_AVAILABLE = True
 except ImportError:
     MUTAGEN_MP4_AVAILABLE = False
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.progress import (
+        Progress,
+        BarColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+        SpinnerColumn,
+        TextColumn,
+    )
+    from rich.theme import Theme
+    from rich.live import Live
+    from rich.text import Text
+    from rich.align import Align
+    from rich.layout import Layout
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+
+console = Console(
+    theme=Theme(
+        {
+            "info": "cyan",
+            "warn": "yellow",
+            "error": "red",
+            "success": "green",
+        }
+    )
+) if RICH_AVAILABLE else None
+
+LOG_LINES: deque = deque(maxlen=400)
+LOG_LOCK = Lock()
+
+
+def add_log(*args):
+    raw = " ".join(str(a) for a in args)
+    if not RICH_AVAILABLE:
+        print(raw)
+        return
+
+    line = Text()
+    m = re.match(r"^(\[[^\]]+\])\s?(.*)$", raw)
+    if m:
+        tag, rest = m.group(1), m.group(2)
+        tag_lower = tag.lower()
+        if "skip" in tag_lower:
+            line.append(tag, style="bold yellow")
+        elif "ok" in tag_lower or "saved" in tag_lower:
+            line.append(tag, style="bold green")
+        elif "err" in tag_lower or "fail" in tag_lower:
+            line.append(tag, style="bold red")
+        elif "warn" in tag_lower:
+            line.append(tag, style="bold yellow")
+        else:
+            line.append(tag, style="bold cyan")
+        line.append(" ")
+        remaining = rest
+    else:
+        remaining = raw
+
+    low = remaining.lower()
+    if any(w in low for w in ["error", "failed", "exception", "timeout"]):
+        style = "bold red"
+    elif any(w in low for w in ["saved", "complete", "exported"]):
+        style = "bold green"
+    elif any(w in low for w in ["skip", "warn"]):
+        style = "yellow"
+    else:
+        style = "white"
+
+    line.append(remaining, style=style)
+    with LOG_LOCK:
+        LOG_LINES.append(line)
+
+
+def build_logs_panel(max_rows: int = 10) -> Any:
+    visible_rows = max(3, max_rows - 2)
+    text = Text()
+    with LOG_LOCK:
+        recent = list(LOG_LINES)[-visible_rows:]
+    first = True
+    for t in recent:
+        if not first:
+            text.append("\n")
+        text.append_text(t)
+        first = False
+    return Panel(Align(text, vertical="bottom"), title="Logs", expand=True)
 
 UUID_PATTERN = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 SHORT_URL_PATTERN = re.compile(r"suno\.com/s/([a-zA-Z0-9_-]+)")
@@ -661,7 +754,13 @@ def process_single_track(
                 if not info_path.exists():
                     write_info_file(meta, info_path)
                 saved_files["info"] = str(info_path)
-            return {"uuid": uuid, "title": meta["title"], "files": saved_files}
+            return {
+                "uuid": uuid,
+                "title": meta["title"],
+                "files": saved_files,
+                "status": "skipped",
+                "skipped_existing": True,
+            }
 
     # 1. Metadata Info Text File
     if "info" in formats:
@@ -689,7 +788,13 @@ def process_single_track(
         decrypted_bytes = fetch_and_decrypt_audio(uuid, meta["stream_url"])
         if not decrypted_bytes:
             log_fn(f"[ERROR] Failed to decrypt audio stream for '{meta['title']}' ({uuid[:8]})")
-            return {"uuid": uuid, "title": meta["title"], "files": saved_files}
+            return {
+                "uuid": uuid,
+                "title": meta["title"],
+                "files": saved_files,
+                "status": "failed",
+                "skipped_existing": False,
+            }
 
         if decrypted_bytes[:4] == b"\x1a\x45\xdf\xa3":
             orig_ext = ".webm"
@@ -736,7 +841,13 @@ def process_single_track(
         temp_audio.unlink(missing_ok=True)
 
     log_fn(f"[OK] Saved '{meta['title']}': {list(saved_files.keys())}")
-    return {"uuid": uuid, "title": meta["title"], "files": saved_files}
+    return {
+        "uuid": uuid,
+        "title": meta["title"],
+        "files": saved_files,
+        "status": "saved",
+        "skipped_existing": False,
+    }
 
 
 def export_csv(songs: List[Dict[str, Any]], out_path: Path):
@@ -769,263 +880,17 @@ def export_zip(file_paths: List[str], zip_path: Path):
                 z.write(p, arcname=p.name)
 
 
-# ---------------------------------------------------------------------------
+## ---------------------------------------------------------------------------
 # Local Web UI
 # ---------------------------------------------------------------------------
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Suno Batch Downloader (Unlimited)</title>
-<style>
-  :root {
-    --bg: #0f1117;
-    --card: #181b26;
-    --border: #2b3044;
-    --accent: #ff3b5c;
-    --accent-hover: #ff5773;
-    --text: #f0f2f8;
-    --muted: #8d94aa;
-    --card-header: #202434;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  body { background: var(--bg); color: var(--text); padding: 24px; min-height: 100vh; }
-  .container { max-width: 1150px; margin: 0 auto; }
-  header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
-  h1 { font-size: 22px; font-weight: 700; color: #fff; display: flex; align-items: center; gap: 10px; }
-  .badge { background: var(--accent); color: white; font-size: 11px; padding: 3px 8px; border-radius: 12px; text-transform: uppercase; font-weight: 700; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 20px; }
-  label { font-size: 13px; font-weight: 600; color: var(--muted); text-transform: uppercase; margin-bottom: 8px; display: block; }
-  textarea { width: 100%; height: 130px; background: #0b0d12; border: 1px solid var(--border); border-radius: 8px; color: #fff; padding: 12px; font-size: 13px; resize: vertical; outline: none; }
-  textarea:focus { border-color: var(--accent); }
-  .controls { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; align-items: center; justify-content: space-between; }
-  .format-group { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
-  .format-group label { text-transform: none; color: var(--text); font-size: 14px; font-weight: normal; margin-bottom: 0; display: flex; align-items: center; gap: 6px; cursor: pointer; }
-  input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
-  button, .btn { background: var(--accent); color: white; border: none; padding: 9px 18px; font-weight: 600; font-size: 13px; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
-  button:hover, .btn:hover { background: var(--accent-hover); }
-  button.secondary, .btn.secondary { background: #252a3b; color: var(--text); border: 1px solid var(--border); }
-  button.secondary:hover, .btn.secondary:hover { background: #32384e; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .status-bar { display: none; margin-top: 15px; font-size: 14px; color: var(--muted); align-items: center; gap: 8px; }
-  .spinner { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; }
-  @keyframes spin { to { transform: rotate(360deg); } }
-  table { width: 100%; border-collapse: collapse; margin-top: 15px; font-size: 13px; }
-  th { text-align: left; padding: 10px; background: var(--card-header); color: var(--muted); border-bottom: 1px solid var(--border); }
-  td { padding: 12px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
-  .cover-thumb { width: 44px; height: 44px; border-radius: 6px; object-fit: cover; background: #000; }
-  .track-title { font-weight: 600; color: #fff; }
-  .track-author { color: var(--muted); font-size: 12px; }
-  .actions { display: flex; gap: 6px; }
-  .actions a, .actions button { font-size: 11px; padding: 4px 8px; border-radius: 4px; }
-  .ffmpeg-alert { background: #332410; border: 1px solid #7c5212; color: #fbd38d; padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 16px; }
-</style>
-</head>
-<body>
-<div class="container">
-  <header>
-    <h1>Suno Batch Downloader <span class="badge">Unlimited</span></h1>
-    <div style="font-size: 13px; color: var(--muted);">Decrypted Audio Recovery · Embedded Tags & Cover Art · Unlimited</div>
-  </header>
+WEB_DIR = Path(__file__).resolve().parent / "web"
+HTML_INDEX_PATH = WEB_DIR / "index.html"
 
-  <div id="ffmpeg-notice" class="ffmpeg-alert" style="display:none;">
-    <strong>Notice:</strong> ffmpeg not found. Original audio (.m4a) will download cleanly. For MP3/WAV transcoding, please install ffmpeg or specify path.
-  </div>
 
-  <div class="card">
-    <label for="urls">Paste Suno URLs (One per line — Unlimited)</label>
-    <textarea id="urls" placeholder="https://suno.com/song/c6bf6234-d3dc-4843-9af5-8d404378e202&#10;https://suno.com/s/kuuNnXWLBeiaN1wU&#10;e02b83e9-b66e-458e-8285-8f1838278b13"></textarea>
-    
-    <div class="controls">
-      <div class="format-group">
-        <label><input type="checkbox" id="fmt-mp3" checked> MP3 (320k)</label>
-        <label><input type="checkbox" id="fmt-orig" checked> Original (M4A)</label>
-        <label><input type="checkbox" id="fmt-wav"> WAV</label>
-        <label><input type="checkbox" id="fmt-cover" checked> Cover Art (.jpeg)</label>
-        <label><input type="checkbox" id="fmt-info"> Separate Info (.txt)</label>
-        <label style="margin-left:8px; border-left:1px solid var(--border); padding-left:12px; color:#10b981;">
-          <input type="checkbox" id="fmt-embed" checked> Embed metadata & cover into audio
-        </label>
-      </div>
-      <div style="display: flex; gap: 10px;">
-        <button id="btn-fetch" onclick="fetchMetadata()">1. Fetch Metadata</button>
-        <button id="btn-download" onclick="downloadZip()" class="secondary" disabled>2. Download All (ZIP)</button>
-      </div>
-    </div>
-    
-    <div id="status" class="status-bar">
-      <span class="spinner"></span> <span id="status-text">Processing...</span>
-    </div>
-  </div>
-
-  <div class="card" id="results-card" style="display:none;">
-    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-      <h2 style="font-size:16px;">Loaded Songs (<span id="track-count">0</span>)</h2>
-      <div style="display:flex; gap:8px;">
-        <button class="secondary" onclick="exportCSV()" style="font-size:12px; padding:6px 12px;">Export CSV</button>
-        <button class="secondary" onclick="exportJSON()" style="font-size:12px; padding:6px 12px;">Export JSON</button>
-      </div>
-    </div>
-    <table id="track-table">
-      <thead>
-        <tr>
-          <th style="width:48px;">Cover</th>
-          <th>Track Info</th>
-          <th>Duration</th>
-          <th>Styles & Model</th>
-          <th>Direct Download</th>
-        </tr>
-      </thead>
-      <tbody id="track-tbody"></tbody>
-    </table>
-  </div>
-</div>
-
-<script>
-let loadedTracks = [];
-
-window.addEventListener('DOMContentLoaded', async () => {
-  try {
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    if (!data.ffmpeg) {
-      document.getElementById('ffmpeg-notice').style.display = 'block';
-    }
-  } catch(e) {}
-});
-
-async function fetchMetadata() {
-  const text = document.getElementById('urls').value.trim();
-  const urls = text.split(/\\r?\\n/).map(u => u.trim()).filter(u => u && !u.startsWith('#'));
-  if (!urls.length) return alert("Please enter at least one Suno URL or UUID.");
-
-  setStatus(true, `Resolving and retrieving metadata for ${urls.length} song(s)...`);
-  document.getElementById('btn-fetch').disabled = true;
-
-  try {
-    const res = await fetch('/api/resolve', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({urls})
-    });
-    const data = await res.json();
-    loadedTracks = data.tracks || [];
-    renderTracks();
-    setStatus(false);
-    if (loadedTracks.length) {
-      document.getElementById('btn-download').disabled = false;
-      document.getElementById('results-card').style.display = 'block';
-    } else {
-      alert("No valid Suno songs found in provided links.");
-    }
-  } catch(e) {
-    alert("Error fetching metadata: " + e.message);
-    setStatus(false);
-  } finally {
-    document.getElementById('btn-fetch').disabled = false;
-  }
-}
-
-function renderTracks() {
-  const tbody = document.getElementById('track-tbody');
-  tbody.innerHTML = '';
-  document.getElementById('track-count').textContent = loadedTracks.length;
-
-  loadedTracks.forEach((t, i) => {
-    const tr = document.createElement('tr');
-    const mins = Math.floor(t.duration / 60);
-    const secs = Math.floor(t.duration % 60).toString().padStart(2, '0');
-    tr.innerHTML = `
-      <td><img class="cover-thumb" src="${t.cover_url}" alt="art" onerror="this.src=''"/></td>
-      <td>
-        <div class="track-title">${t.title}</div>
-        <div class="track-author">${t.author}</div>
-      </td>
-      <td>${mins}:${secs}</td>
-      <td style="color:var(--muted); max-width:280px; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
-        ${t.styles || t.genre || '-'}<br>
-        <span style="color:#718096; font-size:11px;">${t.model || ''}</span>
-      </td>
-      <td>
-        <div class="actions">
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=mp3&embed=1" title="Download 320k MP3 with embedded tags & cover">MP3</a>
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=original&embed=1" title="Download original M4A with embedded tags">M4A</a>
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=wav&embed=1" title="Download WAV">WAV</a>
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=info" title="Download generation info text file">Info</a>
-          <a class="btn secondary" href="${t.cover_url}" target="_blank" download="${t.title}.jpeg" title="Download Cover Art">Cover</a>
-        </div>
-      </td>
-    `;
-    tbody.appendChild(tr);
-  });
-}
-
-function getSelectedFormats() {
-  const fmts = [];
-  if (document.getElementById('fmt-mp3').checked) fmts.push('mp3');
-  if (document.getElementById('fmt-orig').checked) fmts.push('original');
-  if (document.getElementById('fmt-wav').checked) fmts.push('wav');
-  if (document.getElementById('fmt-cover').checked) fmts.push('cover');
-  if (document.getElementById('fmt-info').checked) fmts.push('info');
-  return fmts;
-}
-
-async function downloadZip() {
-  if (!loadedTracks.length) return;
-  const fmts = getSelectedFormats();
-  if (!fmts.length) return alert("Select at least one format checkbox.");
-  const embedMeta = document.getElementById('fmt-embed').checked;
-
-  setStatus(true, `Decrypting, converting and packaging ${loadedTracks.length} song(s)... Please wait.`);
-  document.getElementById('btn-download').disabled = true;
-
-  try {
-    const res = await fetch('/api/download-zip', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({tracks: loadedTracks, formats: fmts, embed: embedMeta})
-    });
-    if (!res.ok) throw new Error("Server failed to build ZIP archive");
-    const blob = await res.blob();
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `suno_recovery_${Date.now()}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setStatus(false);
-  } catch(e) {
-    alert("Error downloading batch: " + e.message);
-    setStatus(false);
-  } finally {
-    document.getElementById('btn-download').disabled = false;
-  }
-}
-
-function exportCSV() {
-  window.location.href = '/api/export-csv';
-}
-
-function exportJSON() {
-  const blob = new Blob([JSON.stringify(loadedTracks, null, 2)], {type: 'application/json'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = `suno_metadata_${Date.now()}.json`;
-  a.click();
-}
-
-function setStatus(show, msg = '') {
-  const el = document.getElementById('status');
-  el.style.display = show ? 'flex' : 'none';
-  document.getElementById('status-text').textContent = msg;
-}
-</script>
-</body>
-</html>
-"""
+def get_web_ui_html() -> bytes:
+    if HTML_INDEX_PATH.exists():
+        return HTML_INDEX_PATH.read_bytes()
+    return b"<h1>Error: web/index.html not found</h1>"
 
 
 class WebUIHandler(BaseHTTPRequestHandler):
@@ -1043,7 +908,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
+            self.wfile.write(get_web_ui_html())
 
         elif parsed.path == "/api/status":
             self.send_response(200)
@@ -1248,6 +1113,8 @@ def main():
     parser.add_argument("--ffmpeg", help="Custom path to ffmpeg executable")
     parser.add_argument("--web", action="store_true", help="Launch local Web UI browser interface")
     parser.add_argument("--port", type=int, default=8080, help="Web UI port (default: 8080)")
+    parser.add_argument("--no-tui", action="store_true", help="Disable Rich interactive terminal UI and use plain text logs")
+    parser.add_argument("--logs-height", type=int, default=10, help="Height of terminal logs panel in lines (default: 10)")
 
     args = parser.parse_args()
 
@@ -1300,33 +1167,278 @@ def main():
         print("No valid Suno URLs or UUIDs found.")
         sys.exit(0)
 
-    print(f"Found {len(unique_uuids)} unique song(s). Fetching metadata...")
+    t_start = time.time()
+    use_tui = RICH_AVAILABLE and not args.no_tui and console is not None and sys.stdout.isatty()
 
+    if use_tui:
+        console.print(
+            Panel.fit(
+                f"[bold cyan]Suno Batch Recovery[/] [dim]|[/] Output: [green]{out_dir}[/] [dim]|[/] Formats: [bold]{','.join(formats)}[/]",
+                border_style="cyan",
+            )
+        )
+    else:
+        print(f"Found {len(unique_uuids)} unique song(s). Fetching metadata...")
+
+    # Phase 1: Fetch Metadata
     songs_meta: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=min(10, args.workers * 2)) as executor:
-        future_to_uuid = {executor.submit(fetch_clip_metadata, uid): uid for uid in unique_uuids}
-        for fut in as_completed(future_to_uuid):
-            uid = future_to_uuid[fut]
-            try:
-                res = fut.result()
-                if res:
-                    songs_meta.append(res)
-                else:
-                    print(f"[WARN] Could not retrieve metadata for {uid}")
-            except Exception as e:
-                print(f"[ERROR] Exception retrieving {uid}: {e}")
+    if use_tui:
+        with Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[bold cyan]Fetching metadata...[/]"),
+            BarColumn(bar_width=None),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("({task.completed}/{task.total})"),
+            TimeElapsedColumn(),
+            console=console,
+        ) as prog:
+            t_meta = prog.add_task("meta", total=len(unique_uuids))
+            with ThreadPoolExecutor(max_workers=min(10, args.workers * 2)) as executor:
+                future_to_uuid = {executor.submit(fetch_clip_metadata, uid): uid for uid in unique_uuids}
+                for fut in as_completed(future_to_uuid):
+                    uid = future_to_uuid[fut]
+                    try:
+                        res = fut.result()
+                        if res:
+                            songs_meta.append(res)
+                            add_log(f"[OK] Resolved {res.get('title', uid[:8])}")
+                        else:
+                            add_log(f"[WARN] Metadata not found for {uid}")
+                    except Exception as e:
+                        add_log(f"[ERROR] Exception retrieving {uid}: {e}")
+                    prog.advance(t_meta, 1)
+    else:
+        with ThreadPoolExecutor(max_workers=min(10, args.workers * 2)) as executor:
+            future_to_uuid = {executor.submit(fetch_clip_metadata, uid): uid for uid in unique_uuids}
+            for fut in as_completed(future_to_uuid):
+                uid = future_to_uuid[fut]
+                try:
+                    res = fut.result()
+                    if res:
+                        songs_meta.append(res)
+                    else:
+                        print(f"[WARN] Could not retrieve metadata for {uid}")
+                except Exception as e:
+                    print(f"[ERROR] Exception retrieving {uid}: {e}")
 
-    print(f"Retrieved metadata for {len(songs_meta)}/{len(unique_uuids)} track(s). Processing downloads...")
-
+    # Phase 2: Processing & Downloading Tracks
     all_saved_files = []
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        futures = [
-            executor.submit(process_single_track, meta, out_dir, formats, ffmpeg_bin, embed_metadata, args.overwrite, print)
-            for meta in songs_meta
-        ]
-        for fut in as_completed(futures):
-            res = fut.result()
-            all_saved_files.extend(res["files"].values())
+    want_mp3 = "mp3" in formats
+    want_wav = "wav" in formats
+    want_orig = "original" in formats
+
+    agg = {
+        "saved": 0,
+        "failed": 0,
+        "skipped_existing": 0,
+        "mp3_saved": 0,
+        "wav_saved": 0,
+        "orig_saved": 0,
+    }
+
+    if use_tui:
+        term_h = console.size.height or 40
+        logs_h_eff = max(6, min(args.logs_height, term_h // 2))
+        downloads_h_eff = max(10, term_h - logs_h_eff - 1)
+
+        layout = Layout()
+        layout.split_column(
+            Layout(name="top", size=logs_h_eff),
+            Layout(name="bottom", size=downloads_h_eff),
+        )
+        layout["bottom"].split_row(
+            Layout(name="left", ratio=3),
+            Layout(name="queue", ratio=1),
+        )
+        stats_height = 6
+        layout["left"].split_column(
+            Layout(name="stats", size=stats_height),
+            Layout(name="active"),
+        )
+
+        queue_text = Text()
+
+        def refresh_queue_text(pending_list: List[str]):
+            queue_text.__init__("\n".join(pending_list))
+
+        progress = Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[info]{task.fields[desc]}"),
+            BarColumn(bar_width=None),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+        )
+
+        layout["top"].update(build_logs_panel(logs_h_eff))
+        layout["active"].update(Panel(progress, title="Active Downloads", expand=True))
+        layout["queue"].update(Panel(Align(queue_text, vertical="top"), title="Queue", expand=True))
+
+        def style_count(n: int, kind: str) -> str:
+            if kind == "ok":
+                return f"[green]{n}[/]" if n > 0 else f"[dim]{n}[/]"
+            if kind == "fail":
+                return f"[red]{n}[/]" if n > 0 else f"[dim]{n}[/]"
+            if kind == "skip":
+                return f"[yellow]{n}[/]" if n > 0 else f"[dim]{n}[/]"
+            return str(n)
+
+        def build_stats_panel() -> Panel:
+            t = Text()
+            t.append("Completed: ", style="bold")
+            parts = [("Tracks ", style_count(agg["saved"], "ok"))]
+            if want_mp3:
+                parts.append(("MP3 ", style_count(agg["mp3_saved"], "ok")))
+            if want_orig:
+                parts.append(("Original ", style_count(agg["orig_saved"], "ok")))
+            if want_wav:
+                parts.append(("WAV ", style_count(agg["wav_saved"], "ok")))
+            first = True
+            for tag, c_str in parts:
+                if not first:
+                    t.append("  ")
+                t.append(tag, style="cyan")
+                t.append_text(Text.from_markup(c_str))
+                first = False
+            t.append("\n")
+
+            t.append("Skipped:   ", style="bold")
+            t.append("Existing ", style="yellow")
+            t.append_text(Text.from_markup(style_count(agg["skipped_existing"], "skip")))
+            t.append("\n")
+
+            t.append("Failed:    ", style="bold")
+            t.append("Errors ", style="red")
+            t.append_text(Text.from_markup(style_count(agg["failed"], "fail")))
+            return Panel(Align(t, vertical="top"), title="Stats", title_align="left", expand=True)
+
+        pending = deque(songs_meta)
+        running: Dict[Any, Tuple[Any, Any]] = {}
+
+        def submit_next(slots: int = 1):
+            nonlocal pending
+            count = 0
+            while pending and count < slots and len(running) < args.workers:
+                meta = pending.popleft()
+                desc = f"#{len(songs_meta) - len(pending)} {meta['title'][:22]} ({meta['id'][:8]})"
+                task_id = progress.add_task("song", total=100, desc=desc)
+                fut = executor.submit(
+                    process_single_track,
+                    meta,
+                    out_dir,
+                    formats,
+                    ffmpeg_bin,
+                    embed_metadata,
+                    args.overwrite,
+                    add_log,
+                )
+                running[fut] = (task_id, meta)
+                count += 1
+            refresh_queue_text([f"{i+1}. {m['title'][:18]} ({m['id'][:8]})" for i, m in enumerate(pending)])
+
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            layout["stats"].update(build_stats_panel())
+            with Live(layout, refresh_per_second=8, console=console):
+                submit_next(slots=args.workers)
+                while running:
+                    done, _ = as_completed(list(running.keys())), None
+                    # Wait briefly for completed tasks
+                    done_futs = []
+                    for f in list(running.keys()):
+                        if f.done():
+                            done_futs.append(f)
+                    if not done_futs:
+                        time.sleep(0.1)
+                        layout["top"].update(build_logs_panel(logs_h_eff))
+                        continue
+
+                    for fut in done_futs:
+                        task_id, meta = running.pop(fut)
+                        try:
+                            res = fut.result()
+                            all_saved_files.extend(res["files"].values())
+                            status = res.get("status")
+                            if status == "skipped":
+                                agg["skipped_existing"] += 1
+                            elif status == "failed":
+                                agg["failed"] += 1
+                            else:
+                                agg["saved"] += 1
+                                if "mp3" in res["files"]:
+                                    agg["mp3_saved"] += 1
+                                if "original" in res["files"]:
+                                    agg["orig_saved"] += 1
+                                if "wav" in res["files"]:
+                                    agg["wav_saved"] += 1
+                        except Exception as ex:
+                            agg["failed"] += 1
+                            add_log(f"[ERROR] Exception on {meta['title']}: {ex}")
+
+                        try:
+                            progress.remove_task(task_id)
+                        except Exception:
+                            progress.update(task_id, visible=False)
+
+                        submit_next(slots=1)
+                        layout["stats"].update(build_stats_panel())
+                        layout["top"].update(build_logs_panel(logs_h_eff))
+    else:
+        print(f"Retrieved metadata for {len(songs_meta)}/{len(unique_uuids)} track(s). Processing downloads...")
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = [
+                executor.submit(process_single_track, meta, out_dir, formats, ffmpeg_bin, embed_metadata, args.overwrite, print)
+                for meta in songs_meta
+            ]
+            for fut in as_completed(futures):
+                res = fut.result()
+                all_saved_files.extend(res["files"].values())
+                status = res.get("status")
+                if status == "skipped":
+                    agg["skipped_existing"] += 1
+                elif status == "failed":
+                    agg["failed"] += 1
+                else:
+                    agg["saved"] += 1
+                    if "mp3" in res["files"]:
+                        agg["mp3_saved"] += 1
+                    if "original" in res["files"]:
+                        agg["orig_saved"] += 1
+                    if "wav" in res["files"]:
+                        agg["wav_saved"] += 1
+
+    # Final Run Summary
+    elapsed = time.time() - t_start
+    mins = int(elapsed // 60)
+    secs = int(elapsed % 60)
+
+    if use_tui:
+        tbl = Table(title="Run Summary", show_edge=True, header_style="bold cyan", title_style="bold cyan")
+        tbl.add_column("Metric", justify="left", style="bold")
+        tbl.add_column("Count", justify="right")
+        tbl.add_row("Total Tracks Found", str(len(unique_uuids)))
+        tbl.add_row("Metadata Resolved", str(len(songs_meta)))
+        tbl.add_row("Newly Downloaded", f"[bold green]{agg['saved']}[/]")
+        if want_mp3:
+            tbl.add_row("  - MP3 Files", f"[green]{agg['mp3_saved']}[/]")
+        if want_orig:
+            tbl.add_row("  - Original Audio", f"[green]{agg['orig_saved']}[/]")
+        if want_wav:
+            tbl.add_row("  - WAV Files", f"[green]{agg['wav_saved']}[/]")
+        tbl.add_row("Skipped (Existing)", f"[yellow]{agg['skipped_existing']}[/]")
+        tbl.add_row("Failed", f"[red]{agg['failed']}[/]" if agg["failed"] else "[dim]0[/]")
+
+        console.print()
+        console.print(
+            Panel(
+                f"Duration: [bold]{mins}m {secs}s[/] ([dim]{elapsed:.1f}s[/])\nOutput Directory: [green]{out_dir.resolve()}[/]",
+                title="Run Complete",
+                expand=False,
+            )
+        )
+        console.print(tbl)
+    else:
+        print(f"\nDone in {mins}m {secs}s. Successfully saved: {agg['saved']}, Skipped existing: {agg['skipped_existing']}, Failed: {agg['failed']}")
 
     if args.csv:
         csv_path = out_dir / f"{in_path.stem}_metadata.csv"
@@ -1343,7 +1455,7 @@ def main():
         export_zip(all_saved_files, zip_path)
         print(f"[OK] ZIP archive created: {zip_path}")
 
-    print(f"\nCompleted {len(songs_meta)} tracks. Output directory: {out_dir.resolve()}")
+    print(f"Output directory: {out_dir.resolve()}")
 
 
 if __name__ == "__main__":
