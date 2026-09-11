@@ -11,26 +11,35 @@ Batch download songs from Suno with embedded metadata (title, artist, cover art,
 pip install requests mutagen rich
 ```
 
-## Usage
+## High-Limit Batch Recovery (September 2026 & Beyond)
 
-**1. Get song URLs** - Run `console.js` in browser console on `https://suno.com/me` (aka `Your Library`), copy output to `urls.txt`.
+To bypass Suno's 403 download blocks and `usesuno.com`'s 20-URL limit, use `suno_batch_recovery.py`. It extracts the progressive audio stream directly from public clip metadata, supports unlimited URLs, and avoids browser CORS issues:
 
-**2. Download**
+### 1. Browser Web UI Mode
+Launch the local web dashboard:
 ```bash
-python unified_downloader.py urls.txt -o ./downloads
+python suno_batch_recovery.py --web
+```
+Open `http://localhost:8080` in your browser. Paste unlimited URLs (`suno.com/song/...`, `suno.com/s/...`, UUIDs), preview tracks, and download MP3/original audio/cover/lyrics or export CSV/JSON/ZIP.
+
+### 2. CLI Batch Mode
+```bash
+python suno_batch_recovery.py urls.txt -o ./downloads --formats original,info --csv --json
 ```
 
-## Options
-Common options:
+Options:
 ```
--o, --output DIR     Output directory (default: ./downloads)
---mp4               Also download MP4
---wav               Also download WAV (requires auth)
---no-metadata       Skip metadata embedding
---name-mode         Filename: uuid|details|input (default: details)
+--formats    Comma-separated list: mp3,wav,original,info,cover (default: original,info)
+--csv        Export catalog table as CSV
+--json       Export structured metadata JSON
+--zip        Package downloaded tracks into a ZIP file
+--workers    Concurrent workers (default: 5)
+--ffmpeg     Path to ffmpeg executable (if not in PATH)
+--web        Launch local Web UI on http://localhost:8080
 ```
-Run `python unified_downloader.py --help` for more info on optional arguments.
 
-
-## Auth (optional, for WAV/private songs)
-Set `SUNO_COOKIE` env var with your browser cookie.
+## Legacy Downloader
+The legacy pre-September 2026 downloader (`unified_downloader.py`) has been archived on branch `pre-suno-6.0-sept-2026`.
+```bash
+git checkout pre-suno-6.0-sept-2026
+```
