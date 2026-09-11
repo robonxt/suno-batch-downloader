@@ -1,6 +1,6 @@
-# Suno Batch Downloader
+# Suno Batch Recovery Tool
 
-Batch download songs from Suno with embedded metadata (title, artist, cover art, styles, lyrics).
+Batch recovery tool for songs from Suno with embedded metadata (title, artist, cover art, styles, lyrics). Extracts progressive audio stream directly from public clip metadata.
 
 ## Requirements
 - Python 3.8+
@@ -11,9 +11,9 @@ Batch download songs from Suno with embedded metadata (title, artist, cover art,
 pip install requests mutagen rich
 ```
 
-## High-Limit Batch Recovery (September 2026 & Beyond)
+## Usage
 
-To bypass Suno's 403 download blocks and `usesuno.com`'s 20-URL limit, use `suno_batch_recovery.py`. It extracts the progressive audio stream directly from public clip metadata, supports unlimited URLs, and avoids browser CORS issues:
+Use `suno_batch_recovery.py`.
 
 ### 1. Browser Web UI Mode
 Launch the local web dashboard:
@@ -24,18 +24,20 @@ Open `http://localhost:8080` in your browser. Paste unlimited URLs (`suno.com/so
 
 ### 2. CLI Batch Mode
 ```bash
-python suno_batch_recovery.py urls.txt -o ./downloads --formats original,info --csv --json
+python suno_batch_recovery.py urls.txt -o ./downloads --formats mp3,original --csv --json
 ```
 
 Options:
 ```
---formats    Comma-separated list: mp3,wav,original,info,cover (default: original,info)
---csv        Export catalog table as CSV
---json       Export structured metadata JSON
---zip        Package downloaded tracks into a ZIP file
---workers    Concurrent workers (default: 5)
---ffmpeg     Path to ffmpeg executable (if not in PATH)
---web        Launch local Web UI on http://localhost:8080
+--formats        Comma-separated list: mp3,original,wav,cover,info (default: mp3,original)
+--no-metadata    Skip embedding metadata tags and artwork into audio files
+--overwrite      Re-download and overwrite existing files (default: skip existing)
+--csv            Export catalog table as CSV
+--json           Export structured metadata JSON
+--zip            Package downloaded tracks into a ZIP file
+--workers        Concurrent workers (default: 5)
+--ffmpeg         Path to ffmpeg executable (if not in PATH)
+--web            Launch local Web UI on http://localhost:8080
 ```
 
 ## Legacy Downloader

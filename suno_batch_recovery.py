@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
 """
 Suno High-Limit Batch Downloader & Recovery Tool
-Replicates usesuno.com/tools/batch/ with unlimited URLs.
-- Retrieves public Suno song metadata via Suno API.
-- Retrieves stream authorization and AES-GCM / AES-CTR decryption keys.
-- Decrypts encrypted CloudFront audio stream into 100% playable audio.
-- Outputs:
-    1. mp3: Transcoded 320kbps MP3 (via ffmpeg).
-    2. wav: Uncompressed 16-bit PCM WAV (via ffmpeg).
-    3. original: Decrypted original audio stream (M4A).
-    4. info: Separate text file containing full generation metadata and prompt.
-    5. cover: High-resolution cover artwork JPEG.
-- No DRM bypass required. No video output. No tagging in MP3.
-- Interactive local Web UI & CLI batch modes. Unlimited capacity.
+Replicates and enhances pre-suno-6.0 batch downloader with 2026 stream decryption.
+- Resolves Suno public song URLs, shortlinks (/s/), hook links, and raw UUIDs.
+- Fetches stream authorization & unwraps keys (AES-GCM).
+- Decrypts CloudFront audio stream (AES-CTR) into 100% playable audio.
+- Embeds metadata (Title, Artist, Album, Year, Genre, Comment/Styles, Lyrics, Cover Art)
+  directly into MP3, M4A, and WAV (same as pre-suno-6.0).
+- Option for separate generation info text file (_info.txt).
+- Web UI (--web) & CLI batch modes with CSV, JSON, and ZIP exports.
 """
 
 import argparse
@@ -49,6 +45,18 @@ try:
     HAS_CRYPTOGRAPHY = True
 except ImportError:
     pass
+
+try:
+    from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, COMM, APIC, TCON, TDRC, USLT, TXXX
+    MUTAGEN_ID3_AVAILABLE = True
+except ImportError:
+    MUTAGEN_ID3_AVAILABLE = False
+
+try:
+    from mutagen.mp4 import MP4, MP4Cover
+    MUTAGEN_MP4_AVAILABLE = True
+except ImportError:
+    MUTAGEN_MP4_AVAILABLE = False
 
 UUID_PATTERN = re.compile(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 SHORT_URL_PATTERN = re.compile(r"suno\.com/s/([a-zA-Z0-9_-]+)")
@@ -117,20 +125,16 @@ class PurePythonAES:
 
     def encrypt_block(self, block: bytes) -> bytes:
         state = list(block)
-        # AddRoundKey 0
         state = [s ^ k for s, k in zip(state, self.round_keys[0])]
         sbox = self.s_box
         for r in range(1, self.nr):
-            # SubBytes
             s = [sbox[b] for b in state]
-            # ShiftRows
             state = [
                 s[0], s[5], s[10], s[15],
                 s[4], s[9], s[14], s[3],
                 s[8], s[13], s[2], s[7],
                 s[12], s[1], s[6], s[11]
             ]
-            # MixColumns
             nxt = [0] * 16
             for c in range(4):
                 idx = c * 4
@@ -140,10 +144,8 @@ class PurePythonAES:
                 nxt[idx + 1] = a0 ^ xtime(a1) ^ xtime(a2) ^ a2 ^ a3
                 nxt[idx + 2] = a0 ^ a1 ^ xtime(a2) ^ xtime(a3) ^ a3
                 nxt[idx + 3] = xtime(a0) ^ a0 ^ a1 ^ a2 ^ xtime(a3)
-            # AddRoundKey
             rk = self.round_keys[r]
             state = [n ^ k for n, k in zip(nxt, rk)]
-        # Final round
         s = [sbox[b] for b in state]
         shifted = [
             s[0], s[5], s[10], s[15],
@@ -176,7 +178,6 @@ def pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
     if len(nonce) == 12:
         j0_bytes = nonce + b"\x00\x00\x00\x01"
     else:
-        # standard arbitrary length nonce hash
         s = nonce + b"\x00" * ((16 - len(nonce) % 16) % 16)
         s += (len(nonce) * 8).to_bytes(16, "big")
         y = 0
@@ -186,7 +187,6 @@ def pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
 
     j0 = int.from_bytes(j0_bytes, "big")
 
-    # Decrypt CTR
     plaintext = bytearray(len(ciphertext))
     counter = (j0 + 1) & 0xffffffffffffffffffffffffffffffff
     for offset in range(0, len(ciphertext), 16):
@@ -196,7 +196,6 @@ def pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
             plaintext[offset + i] = ciphertext[offset + i] ^ ks[i]
         counter = (counter + 1) & 0xffffffffffffffffffffffffffffffff
 
-    # Compute GHASH
     pad_aad = aad + b"\x00" * ((16 - len(aad) % 16) % 16)
     pad_c = ciphertext + b"\x00" * ((16 - len(ciphertext) % 16) % 16)
     data = pad_aad + pad_c + (len(aad) * 8).to_bytes(8, "big") + (len(ciphertext) * 8).to_bytes(8, "big")
@@ -206,9 +205,6 @@ def pure_aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes
         y = _gf_mult(y ^ int.from_bytes(data[i : i + 16], "big"), h)
 
     auth_tag = bytes(a ^ b for a, b in zip(y.to_bytes(16, "big"), aes.encrypt_block(j0_bytes)))
-    if auth_tag != tag:
-        # Fallback accept if tag mismatch in small variations
-        pass
     return bytes(plaintext)
 
 
@@ -236,7 +232,6 @@ def decrypt_aes_ctr(key: bytes, initial_iv: bytes, data: bytes) -> bytes:
         except Exception:
             pass
 
-    # Pure Python CTR decryption
     aes = PurePythonAES(key)
     res = bytearray(len(data))
     iv_int = int.from_bytes(initial_iv, "big")
@@ -389,7 +384,6 @@ def fetch_clip_metadata(uuid: str, timeout: int = 15) -> Optional[Dict[str, Any]
 
 
 def fetch_and_decrypt_audio(uuid: str, stream_url: str) -> Optional[bytes]:
-    # 1. Fetch encrypted audio
     try:
         r_audio = SESSION.get(stream_url, timeout=60)
         if r_audio.status_code != 200 or len(r_audio.content) == 0:
@@ -398,7 +392,6 @@ def fetch_and_decrypt_audio(uuid: str, stream_url: str) -> Optional[bytes]:
     except Exception:
         return None
 
-    # 2. Fetch decryption rights
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -422,15 +415,10 @@ def fetch_and_decrypt_audio(uuid: str, stream_url: str) -> Optional[bytes]:
         if not (key_b64 and iv_b64 and glt):
             return None
 
-        # Derive user key from glt
         user_key = hashlib.sha256(glt.encode("utf-8")).digest()
-
-        # Unwrap key & IV via AES-GCM
         aad = uuid.encode("utf-8")
         content_key = decrypt_aes_gcm(user_key, base64.b64decode(key_b64), aad)
         content_iv = decrypt_aes_gcm(user_key, base64.b64decode(iv_b64), aad)
-
-        # Decrypt audio stream via AES-CTR
         decrypted_audio = decrypt_aes_ctr(content_key, content_iv, encrypted_bytes)
         return decrypted_audio
     except Exception:
@@ -454,7 +442,6 @@ def convert_to_mp3(ffmpeg_bin: str, input_path: Path, output_path: Path) -> bool
     except Exception:
         pass
 
-    # Fallback without explicit libmp3lame
     cmd_fallback = [
         ffmpeg_bin,
         "-y",
@@ -470,18 +457,134 @@ def convert_to_mp3(ffmpeg_bin: str, input_path: Path, output_path: Path) -> bool
         return False
 
 
-def convert_to_wav(ffmpeg_bin: str, input_path: Path, output_path: Path) -> bool:
+def convert_to_wav(ffmpeg_bin: str, input_path: Path, output_path: Path, meta: Optional[Dict[str, Any]] = None) -> bool:
     cmd = [
         ffmpeg_bin,
         "-y",
         "-i", str(input_path),
         "-vn",
         "-c:a", "pcm_s16le",
-        str(output_path),
     ]
+    if meta:
+        if meta.get("title"):
+            cmd.extend(["-metadata", f"title={meta['title']}"])
+        if meta.get("author"):
+            cmd.extend(["-metadata", f"artist={meta['author']}"])
+        cmd.extend(["-metadata", "album=Suno AI"])
+        if meta.get("styles"):
+            cmd.extend(["-metadata", f"comment={meta['styles'][:200]}"])
+    cmd.append(str(output_path))
     try:
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return res.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
+    except Exception:
+        return False
+
+
+def embed_id3_metadata(mp3_path: Path, meta: Dict[str, Any], cover_bytes: Optional[bytes] = None) -> bool:
+    if not MUTAGEN_ID3_AVAILABLE:
+        return False
+    try:
+        try:
+            tags = ID3(str(mp3_path))
+        except Exception:
+            tags = ID3()
+
+        tags.delall("TIT2")
+        tags.add(TIT2(encoding=3, text=meta.get("title", "")))
+
+        tags.delall("TPE1")
+        tags.add(TPE1(encoding=3, text=meta.get("author", "Suno Creator")))
+
+        tags.delall("TALB")
+        tags.add(TALB(encoding=3, text="Suno AI"))
+
+        tags.delall("TPE2")
+        tags.add(TPE2(encoding=3, text="Suno AI"))
+
+        genre = meta.get("genre") or meta.get("styles") or "AI Music"
+        tags.delall("TCON")
+        tags.add(TCON(encoding=3, text=genre))
+
+        date_val = meta.get("date") or meta.get("year")
+        if date_val:
+            tags.delall("TDRC")
+            tags.add(TDRC(encoding=3, text=date_val))
+
+        comment_parts = []
+        if meta.get("styles"):
+            comment_parts.append(f"Styles: {meta['styles']}")
+        if meta.get("model"):
+            comment_parts.append(f"Model: {meta['model']}")
+        if meta.get("page_url"):
+            comment_parts.append(f"URL: {meta['page_url']}")
+        if meta.get("id"):
+            comment_parts.append(f"UUID: {meta['id']}")
+        if comment_parts:
+            tags.delall("COMM")
+            tags.add(COMM(encoding=3, lang="eng", desc="", text="\n".join(comment_parts)))
+
+        if meta.get("lyrics"):
+            tags.delall("USLT")
+            tags.add(USLT(encoding=3, lang="eng", desc="", text=meta["lyrics"]))
+
+        def set_txxx(desc: str, val: Any):
+            tags.delall(f"TXXX:{desc}")
+            if val:
+                tags.add(TXXX(encoding=3, desc=desc, text=str(val)))
+
+        set_txxx("SUNO_UUID", meta.get("id"))
+        set_txxx("SUNO_URL", meta.get("page_url"))
+        set_txxx("SUNO_MODEL", meta.get("model"))
+        set_txxx("SUNO_STYLES", meta.get("styles"))
+
+        if cover_bytes:
+            tags.delall("APIC")
+            tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover_bytes))
+
+        tags.save(str(mp3_path), v2_version=3)
+        return True
+    except Exception:
+        return False
+
+
+def embed_m4a_metadata(m4a_path: Path, meta: Dict[str, Any], cover_bytes: Optional[bytes] = None) -> bool:
+    if not MUTAGEN_MP4_AVAILABLE:
+        return False
+    try:
+        tags = MP4(str(m4a_path))
+        if meta.get("title"):
+            tags["\xa9nam"] = [meta["title"]]
+        if meta.get("author"):
+            tags["\xa9ART"] = [meta["author"]]
+        tags["\xa9alb"] = ["Suno AI"]
+        tags["aART"] = ["Suno AI"]
+        date_val = meta.get("date") or meta.get("year")
+        if date_val:
+            tags["\xa9day"] = [date_val]
+        genre = meta.get("genre") or meta.get("styles") or "AI Music"
+        tags["\xa9gen"] = [genre]
+
+        comment_parts = []
+        if meta.get("styles"):
+            comment_parts.append(f"Styles: {meta['styles']}")
+        if meta.get("model"):
+            comment_parts.append(f"Model: {meta['model']}")
+        if meta.get("page_url"):
+            comment_parts.append(f"URL: {meta['page_url']}")
+        if meta.get("id"):
+            comment_parts.append(f"UUID: {meta['id']}")
+        if comment_parts:
+            tags["\xa9cmt"] = ["\n".join(comment_parts)]
+
+        if meta.get("lyrics"):
+            tags["\xa9lyr"] = [meta["lyrics"]]
+
+        if cover_bytes:
+            tags["covr"] = [MP4Cover(cover_bytes, imageformat=MP4Cover.FORMAT_JPEG)]
+
+        tags.save()
+        return True
     except Exception:
         return False
 
@@ -517,6 +620,8 @@ def process_single_track(
     out_dir: Path,
     formats: List[str],
     ffmpeg_bin: Optional[str] = None,
+    embed_metadata: bool = True,
+    overwrite: bool = False,
     log_fn=print,
 ) -> Dict[str, Any]:
     uuid = meta["id"]
@@ -526,32 +631,66 @@ def process_single_track(
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Metadata Info Text File (separate file, not tags)
+    # Check if target files already exist in output folder (skip re-downloading)
+    need_audio = any(f in formats for f in ["mp3", "wav", "original"])
+    audio_formats = [f for f in formats if f in ["mp3", "wav", "original"]]
+
+    if not overwrite and audio_formats:
+        all_audio_found = True
+        for afmt in audio_formats:
+            ext = ".mp3" if afmt == "mp3" else (".wav" if afmt == "wav" else ".m4a")
+            exact_p = out_dir / f"{base_name}{ext}"
+            if exact_p.exists() and exact_p.stat().st_size > 1024:
+                saved_files[afmt] = str(exact_p)
+            else:
+                # Also match any file with this UUID
+                found = False
+                for match in out_dir.glob(f"*{uuid[:8]}*{ext}"):
+                    if match.exists() and match.stat().st_size > 1024:
+                        saved_files[afmt] = str(match)
+                        found = True
+                        break
+                if not found:
+                    all_audio_found = False
+
+        if all_audio_found:
+            log_fn(f"[SKIP] Existing: '{meta['title']}' ({uuid[:8]})")
+            # Write info/cover if requested and missing
+            if "info" in formats:
+                info_path = out_dir / f"{base_name}_info.txt"
+                if not info_path.exists():
+                    write_info_file(meta, info_path)
+                saved_files["info"] = str(info_path)
+            return {"uuid": uuid, "title": meta["title"], "files": saved_files}
+
+    # 1. Metadata Info Text File
     if "info" in formats:
         info_path = out_dir / f"{base_name}_info.txt"
         write_info_file(meta, info_path)
         saved_files["info"] = str(info_path)
 
-    # 2. Cover Art JPEG
-    if "cover" in formats and meta.get("cover_url"):
-        try:
-            r = SESSION.get(meta["cover_url"], timeout=20)
-            if r.status_code == 200:
-                cover_path = out_dir / f"{base_name}.jpeg"
-                cover_path.write_bytes(r.content)
-                saved_files["cover"] = str(cover_path)
-        except Exception:
-            pass
+    # 2. Cover Art JPEG & Bytes for embedding
+    cover_bytes = None
+    if "cover" in formats or embed_metadata:
+        if meta.get("cover_url"):
+            try:
+                r = SESSION.get(meta["cover_url"], timeout=20)
+                if r.status_code == 200:
+                    cover_bytes = r.content
+                    if "cover" in formats:
+                        cover_path = out_dir / f"{base_name}.jpeg"
+                        cover_path.write_bytes(cover_bytes)
+                        saved_files["cover"] = str(cover_path)
+            except Exception:
+                pass
 
-    # 3. Audio Processing (Decryption + optional Transcoding)
-    need_audio = any(f in formats for f in ["mp3", "wav", "original"])
+    # 3. Audio Processing (Decryption + optional Transcoding & Tagging)
     if need_audio and meta.get("stream_url"):
         decrypted_bytes = fetch_and_decrypt_audio(uuid, meta["stream_url"])
         if not decrypted_bytes:
             log_fn(f"[ERROR] Failed to decrypt audio stream for '{meta['title']}' ({uuid[:8]})")
             return {"uuid": uuid, "title": meta["title"], "files": saved_files}
 
-        # Sniff decrypted stream container
         if decrypted_bytes[:4] == b"\x1a\x45\xdf\xa3":
             orig_ext = ".webm"
         elif decrypted_bytes[:3] == b"ID3" or (len(decrypted_bytes) >= 2 and decrypted_bytes[0] == 0xFF and (decrypted_bytes[1] & 0xE0) == 0xE0):
@@ -566,6 +705,8 @@ def process_single_track(
         if "original" in formats:
             orig_dest = out_dir / f"{base_name}{orig_ext}"
             shutil.copyfile(temp_audio, orig_dest)
+            if embed_metadata and orig_ext == ".m4a":
+                embed_m4a_metadata(orig_dest, meta, cover_bytes)
             saved_files["original"] = str(orig_dest)
 
         # MP3
@@ -573,8 +714,12 @@ def process_single_track(
             mp3_dest = out_dir / f"{base_name}.mp3"
             if orig_ext == ".mp3":
                 shutil.copyfile(temp_audio, mp3_dest)
+                if embed_metadata:
+                    embed_id3_metadata(mp3_dest, meta, cover_bytes)
                 saved_files["mp3"] = str(mp3_dest)
             elif ffmpeg_bin and convert_to_mp3(ffmpeg_bin, temp_audio, mp3_dest):
+                if embed_metadata:
+                    embed_id3_metadata(mp3_dest, meta, cover_bytes)
                 saved_files["mp3"] = str(mp3_dest)
             else:
                 log_fn(f"[WARN] ffmpeg required to transcode decrypted {orig_ext} to MP3 for '{meta['title']}'.")
@@ -582,7 +727,8 @@ def process_single_track(
         # WAV
         if "wav" in formats:
             wav_dest = out_dir / f"{base_name}.wav"
-            if ffmpeg_bin and convert_to_wav(ffmpeg_bin, temp_audio, wav_dest):
+            wav_meta = meta if embed_metadata else None
+            if ffmpeg_bin and convert_to_wav(ffmpeg_bin, temp_audio, wav_dest, wav_meta):
                 saved_files["wav"] = str(wav_dest)
             else:
                 log_fn(f"[WARN] ffmpeg required to transcode decrypted {orig_ext} to WAV for '{meta['title']}'.")
@@ -654,7 +800,7 @@ HTML_PAGE = """<!DOCTYPE html>
   textarea { width: 100%; height: 130px; background: #0b0d12; border: 1px solid var(--border); border-radius: 8px; color: #fff; padding: 12px; font-size: 13px; resize: vertical; outline: none; }
   textarea:focus { border-color: var(--accent); }
   .controls { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; align-items: center; justify-content: space-between; }
-  .format-group { display: flex; gap: 14px; align-items: center; }
+  .format-group { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
   .format-group label { text-transform: none; color: var(--text); font-size: 14px; font-weight: normal; margin-bottom: 0; display: flex; align-items: center; gap: 6px; cursor: pointer; }
   input[type="checkbox"] { accent-color: var(--accent); width: 16px; height: 16px; }
   button, .btn { background: var(--accent); color: white; border: none; padding: 9px 18px; font-weight: 600; font-size: 13px; border-radius: 6px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
@@ -680,11 +826,11 @@ HTML_PAGE = """<!DOCTYPE html>
 <div class="container">
   <header>
     <h1>Suno Batch Downloader <span class="badge">Unlimited</span></h1>
-    <div style="font-size: 13px; color: var(--muted);">Decrypted Audio Recovery · Separate Info Files · Zero Limits</div>
+    <div style="font-size: 13px; color: var(--muted);">Decrypted Audio Recovery · Embedded Tags & Cover Art · Unlimited</div>
   </header>
 
   <div id="ffmpeg-notice" class="ffmpeg-alert" style="display:none;">
-    <strong>Notice:</strong> ffmpeg not found. Original audio (.m4a) and metadata info will download cleanly. For MP3/WAV transcoding, please install ffmpeg or specify path.
+    <strong>Notice:</strong> ffmpeg not found. Original audio (.m4a) will download cleanly. For MP3/WAV transcoding, please install ffmpeg or specify path.
   </div>
 
   <div class="card">
@@ -694,10 +840,13 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="controls">
       <div class="format-group">
         <label><input type="checkbox" id="fmt-mp3" checked> MP3 (320k)</label>
-        <label><input type="checkbox" id="fmt-wav"> WAV (Lossless)</label>
         <label><input type="checkbox" id="fmt-orig" checked> Original (M4A)</label>
-        <label><input type="checkbox" id="fmt-info" checked> Info (.txt)</label>
-        <label><input type="checkbox" id="fmt-cover" checked> Cover Art</label>
+        <label><input type="checkbox" id="fmt-wav"> WAV</label>
+        <label><input type="checkbox" id="fmt-cover" checked> Cover Art (.jpeg)</label>
+        <label><input type="checkbox" id="fmt-info"> Separate Info (.txt)</label>
+        <label style="margin-left:8px; border-left:1px solid var(--border); padding-left:12px; color:#10b981;">
+          <input type="checkbox" id="fmt-embed" checked> Embed metadata & cover into audio
+        </label>
       </div>
       <div style="display: flex; gap: 10px;">
         <button id="btn-fetch" onclick="fetchMetadata()">1. Fetch Metadata</button>
@@ -800,10 +949,10 @@ function renderTracks() {
       </td>
       <td>
         <div class="actions">
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=mp3" title="Download clean 320k MP3">MP3</a>
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=wav" title="Download lossless WAV">WAV</a>
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=original" title="Download decrypted original M4A">M4A</a>
-          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=info" title="Download generation info text file">Info (.txt)</a>
+          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=mp3&embed=1" title="Download 320k MP3 with embedded tags & cover">MP3</a>
+          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=original&embed=1" title="Download original M4A with embedded tags">M4A</a>
+          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=wav&embed=1" title="Download WAV">WAV</a>
+          <a class="btn secondary" href="/api/download-single?id=${t.id}&fmt=info" title="Download generation info text file">Info</a>
           <a class="btn secondary" href="${t.cover_url}" target="_blank" download="${t.title}.jpeg" title="Download Cover Art">Cover</a>
         </div>
       </td>
@@ -815,10 +964,10 @@ function renderTracks() {
 function getSelectedFormats() {
   const fmts = [];
   if (document.getElementById('fmt-mp3').checked) fmts.push('mp3');
-  if (document.getElementById('fmt-wav').checked) fmts.push('wav');
   if (document.getElementById('fmt-orig').checked) fmts.push('original');
-  if (document.getElementById('fmt-info').checked) fmts.push('info');
+  if (document.getElementById('fmt-wav').checked) fmts.push('wav');
   if (document.getElementById('fmt-cover').checked) fmts.push('cover');
+  if (document.getElementById('fmt-info').checked) fmts.push('info');
   return fmts;
 }
 
@@ -826,6 +975,7 @@ async function downloadZip() {
   if (!loadedTracks.length) return;
   const fmts = getSelectedFormats();
   if (!fmts.length) return alert("Select at least one format checkbox.");
+  const embedMeta = document.getElementById('fmt-embed').checked;
 
   setStatus(true, `Decrypting, converting and packaging ${loadedTracks.length} song(s)... Please wait.`);
   document.getElementById('btn-download').disabled = true;
@@ -834,7 +984,7 @@ async function downloadZip() {
     const res = await fetch('/api/download-zip', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({tracks: loadedTracks, formats: fmts})
+      body: JSON.stringify({tracks: loadedTracks, formats: fmts, embed: embedMeta})
     });
     if (!res.ok) throw new Error("Server failed to build ZIP archive");
     const blob = await res.blob();
@@ -926,6 +1076,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/download-single":
             track_id = query.get("id", [None])[0]
             fmt = query.get("fmt", ["mp3"])[0].lower()
+            embed_meta = query.get("embed", ["1"])[0] == "1"
 
             target_track = None
             for t in WebUIHandler.cached_tracks:
@@ -951,6 +1102,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 out_dir=run_dir,
                 formats=[fmt],
                 ffmpeg_bin=WebUIHandler.ffmpeg_bin,
+                embed_metadata=embed_meta,
                 log_fn=lambda _: None,
             )
 
@@ -1019,7 +1171,8 @@ class WebUIHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/download-zip":
             req_data = json.loads(post_body)
             tracks = req_data.get("tracks", [])
-            formats = req_data.get("formats", ["original", "info"])
+            formats = req_data.get("formats", ["mp3"])
+            embed_meta = bool(req_data.get("embed", True))
 
             temp_dir = Path("./.suno_web_tmp")
             temp_dir.mkdir(exist_ok=True)
@@ -1034,6 +1187,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     out_dir=run_dir,
                     formats=formats,
                     ffmpeg_bin=WebUIHandler.ffmpeg_bin,
+                    embed_metadata=embed_meta,
                     log_fn=lambda _: None,
                 )
                 return list(res["files"].values())
@@ -1068,6 +1222,7 @@ def run_web_server(port: int = 8080, ffmpeg_bin: Optional[str] = None):
     print(f" Suno High-Limit Downloader Web UI running at:")
     print(f" {url}")
     print(f" Transcoding: {'ffmpeg detected (' + ffmpeg_bin + ')' if ffmpeg_bin else 'ffmpeg NOT found (Original M4A & Info available)'}")
+    print(f" Metadata embedding: ACTIVE (MP3, M4A, WAV)")
     print(f" Unlimited URLs. Decryption engine active. Zero CORS.")
     print(f" Press Ctrl+C to stop.")
     print("=" * 60)
@@ -1081,8 +1236,11 @@ def run_web_server(port: int = 8080, ffmpeg_bin: Optional[str] = None):
 def main():
     parser = argparse.ArgumentParser(description="Suno High-Limit Batch Recovery and Downloader")
     parser.add_argument("songfile", nargs="?", help="Input file with Suno URLs or UUIDs (one per line)")
+    parser.add_argument("--songfile", dest="songfile_flag", help="Input file (flag alias)")
     parser.add_argument("-o", "--output-dir", default="./downloads", help="Output directory (default: ./downloads)")
-    parser.add_argument("--formats", default="original,info", help="Comma list: mp3,wav,original,info,cover (default: original,info)")
+    parser.add_argument("--formats", default="mp3,original", help="Comma list: mp3,original,wav,cover,info (default: mp3,original)")
+    parser.add_argument("--no-metadata", action="store_true", help="Skip embedding metadata tags and artwork into audio files")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite and re-download files if they already exist (default: skip existing)")
     parser.add_argument("--csv", action="store_true", help="Export metadata catalog as CSV")
     parser.add_argument("--json", action="store_true", help="Export structured metadata catalog as JSON")
     parser.add_argument("--zip", action="store_true", help="Package downloaded files into a ZIP archive")
@@ -1099,12 +1257,13 @@ def main():
         run_web_server(args.port, ffmpeg_bin)
         return
 
-    if not args.songfile:
-        print("Usage error: specify an input file (e.g., urls.txt) or use --web to launch the browser UI.")
+    raw_songfile = args.songfile_flag or args.songfile
+    if not raw_songfile:
+        print("Usage error: specify an input file (e.g., urls.txt or --songfile urls.txt) or use --web to launch the browser UI.")
         parser.print_help()
         sys.exit(1)
 
-    in_path = Path(args.songfile)
+    in_path = Path(raw_songfile)
     if not in_path.exists():
         print(f"Error: input file not found: {in_path}")
         sys.exit(1)
@@ -1113,6 +1272,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     formats = [f.strip().lower() for f in args.formats.split(",") if f.strip()]
+    embed_metadata = not args.no_metadata
 
     if not ffmpeg_bin and ("mp3" in formats or "wav" in formats):
         print("[WARN] ffmpeg not found in PATH or standard directories.")
@@ -1156,12 +1316,12 @@ def main():
             except Exception as e:
                 print(f"[ERROR] Exception retrieving {uid}: {e}")
 
-    print(f"Retrieved metadata for {len(songs_meta)}/{len(unique_uuids)} track(s). Decrypting & downloading...")
+    print(f"Retrieved metadata for {len(songs_meta)}/{len(unique_uuids)} track(s). Processing downloads...")
 
     all_saved_files = []
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = [
-            executor.submit(process_single_track, meta, out_dir, formats, ffmpeg_bin, print)
+            executor.submit(process_single_track, meta, out_dir, formats, ffmpeg_bin, embed_metadata, args.overwrite, print)
             for meta in songs_meta
         ]
         for fut in as_completed(futures):
