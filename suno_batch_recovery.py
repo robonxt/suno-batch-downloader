@@ -936,7 +936,43 @@ class WebUIHandler(BaseHTTPRequestHandler):
                     s.get("page_url", ""),
                     s.get("stream_url", ""),
                 ])
-            self.wfile.write(sio.getvalue().encode("utf-8-sig"))
+        elif parsed.path == "/api/stream":
+            track_id = query.get("id", [None])[0]
+            target_track = None
+            for t in WebUIHandler.cached_tracks:
+                if t.get("id") == track_id:
+                    target_track = t
+                    break
+            if not target_track and track_id:
+                target_track = fetch_clip_metadata(track_id)
+
+            if not target_track or not target_track.get("stream_url"):
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Track not found")
+                return
+
+            decrypted = fetch_and_decrypt_audio(target_track["id"], target_track["stream_url"])
+            if not decrypted:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(b"Failed to decrypt audio")
+                return
+
+            # Determine mime
+            if decrypted[:4] == b"\x1a\x45\xdf\xa3":
+                mime = "audio/webm"
+            elif decrypted[:3] == b"ID3" or (len(decrypted) >= 2 and decrypted[0] == 0xFF and (decrypted[1] & 0xE0) == 0xE0):
+                mime = "audio/mpeg"
+            else:
+                mime = "audio/mp4"
+
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(decrypted)))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            self.wfile.write(decrypted)
 
         elif parsed.path == "/api/download-single":
             track_id = query.get("id", [None])[0]
