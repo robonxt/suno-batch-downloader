@@ -78,6 +78,10 @@
     <strong>Notice:</strong> ffmpeg not found. Original audio (.m4a) will download cleanly. For MP3/WAV transcoding, please install ffmpeg or specify path.
   </div>
 
+  <div id="mutagen-notice" class="ffmpeg-alert" style="display:none; background:#2d1518; border-color:#842029; color:#f8d7da;">
+    <strong>Warning:</strong> Python library <code>mutagen</code> is not installed. Metadata tags and cover art cannot be embedded into downloaded audio. Run <code>pip install mutagen</code> in terminal.
+  </div>
+
   <div class="card">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
       <label for="urls" style="margin-bottom:0;">Paste Suno URLs (One per line — Unlimited)</label>
@@ -157,6 +161,9 @@ window.addEventListener('DOMContentLoaded', async () => {
     const data = await res.json();
     if (!data.ffmpeg) {
       document.getElementById('ffmpeg-notice').style.display = 'block';
+    }
+    if (!data.mutagen) {
+      document.getElementById('mutagen-notice').style.display = 'block';
     }
   } catch(e) {}
 });

@@ -1,5 +1,24 @@
 (async function () {
-  if (!window.Clerk?.session) {
+  function getSessionToken() {
+    const match = document.cookie.match(/(?:^|;\s*)__session=([^;]+)/);
+    if (match && match[1]) return match[1];
+    const matchAlt = document.cookie.match(/(?:^|;\s*)__session_[^=]+=([^;]+)/);
+    if (matchAlt && matchAlt[1]) return matchAlt[1];
+    return null;
+  }
+
+  async function resolveAuthToken() {
+    if (window.Clerk?.session?.getToken) {
+      try {
+        const t = await window.Clerk.session.getToken();
+        if (t) return t;
+      } catch (_) {}
+    }
+    return getSessionToken();
+  }
+
+  const initialToken = await resolveAuthToken();
+  if (!initialToken) {
     alert("Please make sure you are logged in on suno.com.");
     return;
   }
@@ -84,10 +103,7 @@
 
       while (attempts < maxAttempts) {
         attempts++;
-        let token = null;
-        try {
-          token = await window.Clerk.session.getToken();
-        } catch (_) {}
+        const token = await resolveAuthToken();
         if (!token) break;
 
         res = await fetch("https://studio-api-prod.suno.com/api/feed/v3", {
